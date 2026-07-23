@@ -59,7 +59,6 @@ jobs:
           echo "Already posted."
           exit 0
 
-      # ------------------------- AI REFINEMENT (Groq) -------------------------
       - name: Refine release notes with Groq
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
@@ -80,15 +79,19 @@ jobs:
             exit 0
           fi
 
-          PROMPT="You are a release notes formatter. Reformat the following release notes into exactly three sections using Markdown level-2 headings (##). Use these exact heading lines:
+          PROMPT="You are a release notes formatter. Reformat the following raw release notes into exactly these three sections using Markdown level-2 headings:
           ## ✨ Features
           ## 🔧 Improvements
           ## 🐛 Fixes
-          Rules:
+
+          Strict rules:
+          - Categorise every bullet point from the original notes into the correct section. Features are new capabilities, Improvements are enhancements or changes to existing things, Fixes are bug resolutions.
+          - If the original notes contain a line like \"Plus fixes:\", extract those items and place them under ## 🐛 Fixes.
           - Do NOT add any horizontal lines, dashes, or separator characters.
           - Write each section as a plain bullet list (using - or •).
-          - If a section has no items, omit it entirely.
+          - If a section has zero items, COMPLETELY REMOVE that section — do not output its heading or the word 'None'.
           - Output only the reformatted notes. No introductory or concluding text.
+
           Original notes:
           ${CLEAN_BODY}"
 
@@ -119,7 +122,6 @@ jobs:
             echo "Successfully refined notes with Groq."
           fi
 
-      # ------------------------- BUILD DISCORD PAYLOADS -------------------------
       - name: Build Discord payloads
         run: |
           set -euo pipefail
@@ -135,7 +137,6 @@ jobs:
           url = release.get("html_url", "")
           prerelease = bool(release.get("prerelease")) or "beta" in tag.lower()
 
-          # Use refined body if available, otherwise raw
           body = ""
           if os.path.exists("refined_body.txt"):
               with open("refined_body.txt", "r", encoding="utf-8") as f:
@@ -149,7 +150,6 @@ jobs:
                   cleaned.append(line)
               body = "\n".join(cleaned).strip()
 
-          # Build description with beta warning and body
           description_parts = []
           if prerelease:
               description_parts.append(
@@ -163,17 +163,14 @@ jobs:
           if not description:
               description = " "
 
-          # Safe truncation to 3900 bytes
           max_bytes = 3900
           if len(description.encode("utf-8")) > max_bytes:
               desc_bytes = description.encode("utf-8")[:max_bytes-3]
               description = desc_bytes.decode("utf-8", "ignore").rstrip() + "..."
 
-          # Role ping (optional)
           role_id = os.environ.get("DISCORD_ROLE_ID", "").strip()
           content = f"<@&{role_id}>" if role_id else ""
 
-          # Single embed payload with markdown headings
           embed_payload = {
               "allowed_mentions": {"parse": []},
               "content": content,
@@ -191,7 +188,6 @@ jobs:
           with open("payload_embed.json", "w", encoding="utf-8") as f:
               json.dump(embed_payload, f, ensure_ascii=False)
 
-          # ---- APK assets ----
           def apk_label(asset_name: str) -> str | None:
               n = asset_name.lower()
               if not n.endswith(".apk"):
@@ -260,10 +256,8 @@ jobs:
             fi
           }
 
-          # 1. Send the single embed message (with role ping if set)
           send_payload "payload_embed.json" "Embed message"
 
-          # 2. Send APK message after
           if [ -f "payload_apk.json" ]; then
             send_payload "payload_apk.json" "APK message"
           fi
