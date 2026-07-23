@@ -6,40 +6,34 @@ on:
     - cron: "*/5 * * * *"
 
 permissions:
-  contents: write
+  contents: read   # we only need to read the variable, not push
 
 concurrency:
   group: zangetsu-event-watcher
-  cancel-in-progress: true
+  cancel-in-progress: true   # still cancel if a new run starts, but with variable updates the next run will resume correctly
 
 env:
   OWNER: Spyou
   REPO: Zangetsu
-  STATE_FILE: .state/last_event_id.txt
 
 jobs:
   watch-events:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout this repo
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Read last processed event ID
+      - name: Read last processed event ID (from repository variable)
         id: last_event
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if [ -f "$STATE_FILE" ]; then
-            LAST_ID="$(tr -d '\r\n' < "$STATE_FILE")"
-            if [ -z "$LAST_ID" ]; then
-              LAST_ID="0"
-            fi
+          if LAST_ID="$(gh api "repos/${{ github.repository }}/actions/variables/LAST_ZANGETSU_EVENT_ID" --jq '.value' 2>/dev/null)"; then
+            echo "Last processed event ID: $LAST_ID"
+            echo "id=$LAST_ID" >> "$GITHUB_OUTPUT"
           else
-            LAST_ID="0"
+            echo "Variable not found, starting from 0."
+            echo "id=0" >> "$GITHUB_OUTPUT"
           fi
-          echo "id=$LAST_ID" >> "$GITHUB_OUTPUT"
 
       - name: Fetch all new repository events (paginated)
         env:
@@ -89,11 +83,12 @@ jobs:
             fi
           done
 
-      - name: Process new events and send to Discord (rotating webhooks)
+      - name: Process new events and send to Discord (resumable, variable-updated)
         env:
           WEBHOOK_1: ${{ secrets.DISCORD_EVENTS_WEBHOOK_URL_1 }}
           WEBHOOK_2: ${{ secrets.DISCORD_EVENTS_WEBHOOK_URL_2 }}
           LAST_ID: ${{ steps.last_event.outputs.id }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -106,9 +101,8 @@ jobs:
           EVENT_TYPES = {"PushEvent", "ForkEvent", "WatchEvent", "IssuesEvent", "IssueCommentEvent", "PullRequestEvent"}
 
           last_id = int(os.environ["LAST_ID"])
-          new_last_id = last_id
+          latest_sent_id = last_id   # will be updated after each successful send
 
-          # Build list of available webhook URLs
           webhooks = []
           for key in ("WEBHOOK_1", "WEBHOOK_2"):
               url = os.environ.get(key, "").strip()
@@ -119,9 +113,24 @@ jobs:
               print("No webhook URLs configured. Exiting.")
               sys.exit(0)
 
+          # Helper to update the repository variable
+          def update_variable(new_id):
+              repo = os.environ["GITHUB_REPOSITORY"]
+              # Use gh api to PATCH the variable
+              subprocess.run(
+                  ["gh", "api", "--method", "PATCH",
+                   f"repos/{repo}/actions/variables/LAST_ZANGETSU_EVENT_ID",
+                   "-f", "name=LAST_ZANGETSU_EVENT_ID",
+                   "-f", f"value={new_id}"],
+                  check=True,
+                  capture_output=True
+              )
+              print(f"Updated variable to {new_id}")
+
           sorted_events = sorted(events, key=lambda e: int(e["id"]))
           embeds_to_send = []
 
+          # Build list of (embed, event_id) for all new events
           for event in sorted_events:
               event_id = int(event["id"])
               if event_id <= last_id:
@@ -129,7 +138,6 @@ jobs:
               if event["type"] not in EVENT_TYPES:
                   continue
 
-              new_last_id = max(new_last_id, event_id)
               actor = event["actor"]
               avatar_url = actor["avatar_url"] + "&s=80"
               actor_name = actor["display_login"]
@@ -163,7 +171,7 @@ jobs:
                       "footer": {"text": repo_name},
                       "timestamp": event["created_at"]
                   }
-                  embeds_to_send.append(embed)
+                  embeds_to_send.append((embed, event_id))
 
               elif event["type"] == "ForkEvent":
                   forkee = payload["forkee"]["full_name"]
@@ -175,7 +183,7 @@ jobs:
                       "footer": {"text": repo_name},
                       "timestamp": event["created_at"]
                   }
-                  embeds_to_send.append(embed)
+                  embeds_to_send.append((embed, event_id))
 
               elif event["type"] == "WatchEvent":
                   embed = {
@@ -186,7 +194,7 @@ jobs:
                       "footer": {"text": repo_name},
                       "timestamp": event["created_at"]
                   }
-                  embeds_to_send.append(embed)
+                  embeds_to_send.append((embed, event_id))
 
               elif event["type"] == "IssuesEvent":
                   issue = payload["issue"]
@@ -203,7 +211,7 @@ jobs:
                       "footer": {"text": repo_name},
                       "timestamp": event["created_at"]
                   }
-                  embeds_to_send.append(embed)
+                  embeds_to_send.append((embed, event_id))
 
               elif event["type"] == "IssueCommentEvent":
                   issue = payload["issue"]
@@ -222,7 +230,7 @@ jobs:
                       "footer": {"text": repo_name},
                       "timestamp": event["created_at"]
                   }
-                  embeds_to_send.append(embed)
+                  embeds_to_send.append((embed, event_id))
 
               elif event["type"] == "PullRequestEvent":
                   pr = payload["pull_request"]
@@ -239,11 +247,10 @@ jobs:
                       "footer": {"text": repo_name},
                       "timestamp": event["created_at"]
                   }
-                  embeds_to_send.append(embed)
+                  embeds_to_send.append((embed, event_id))
 
           sent_count = 0
-          for i, embed in enumerate(embeds_to_send):
-              # Rotate webhooks: use index modulo number of webhooks
+          for i, (embed, event_id) in enumerate(embeds_to_send):
               webhook_url = webhooks[i % len(webhooks)]
 
               payload_json = {
@@ -269,51 +276,18 @@ jobs:
                       time.sleep(5)
 
               if not success:
-                  print(f"Failed to send embed after 3 attempts to {webhook_url[-20:]}. Stopping sending.", file=sys.stderr)
+                  print(f"Failed to send embed for event {event_id}. Stopping sending.", file=sys.stderr)
+                  # Still save the last successfully sent ID (latest_sent_id) so next run continues from there
                   break
 
-              # Wait 4 minutes between messages (unless it's the last one)
+              # Successfully sent – update the variable right away so we can resume
+              latest_sent_id = event_id
+              update_variable(latest_sent_id)
+
+              # Wait 4 minutes before next message (unless it's the last one)
               if i < len(embeds_to_send) - 1:
                   print("Waiting 4 minutes before next message...")
                   time.sleep(240)
 
           print(f"Sent {sent_count} message(s) for new events.")
-
-          # Save the highest event ID processed
-          with open("new_last_id.txt", "w") as f:
-              f.write(str(new_last_id))
           PY
-
-      - name: Save latest event ID
-        run: |
-          set -euo pipefail
-
-          mkdir -p .state
-          cp new_last_id.txt "$STATE_FILE"
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # Force-add to bypass .gitignore
-          git add -f "$STATE_FILE"
-
-          # Only commit if there's something to commit
-          if git diff --cached --quiet; then
-            echo "State file unchanged, nothing to commit."
-            exit 0
-          fi
-
-          git commit -m "Update last event ID"
-
-          # Push with retry
-          for i in 1 2 3; do
-            echo "Push attempt $i..."
-            if git push origin HEAD; then
-              echo "Push successful."
-              exit 0
-            fi
-            sleep 5
-          done
-
-          echo "::error::Push failed after 3 attempts."
-          exit 1
