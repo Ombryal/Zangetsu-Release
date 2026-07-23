@@ -81,19 +81,16 @@ jobs:
           fi
 
           PROMPT="You are a release notes formatter. Reformat the following release notes into exactly three short sections. Use these section titles exactly as shown (capitalised, with emojis, no extra characters):
-
-✨ Features
-🔧 Improvements
-🐛 Fixes
-
-Rules:
-- Do NOT add any horizontal lines, dashes, asterisks, or separator characters between sections.
-- Write each section as a plain bullet list (using •).
-- If a section has no items, omit it entirely.
-- Output only the reformatted notes. No introductory or concluding text.
-
-Original notes:
-${CLEAN_BODY}"
+          ✨ Features
+          🔧 Improvements
+          🐛 Fixes
+          Rules:
+          - Do NOT add any horizontal lines, dashes, asterisks, or separator characters between sections.
+          - Write each section as a plain bullet list (using - or •).
+          - If a section has no items, omit it entirely.
+          - Output only the reformatted notes. No introductory or concluding text.
+          Original notes:
+          ${CLEAN_BODY}"
 
           ESCAPED_PROMPT="$(echo "$PROMPT" | jq -Rs .)"
 
