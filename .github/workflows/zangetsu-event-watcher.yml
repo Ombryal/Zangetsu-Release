@@ -7,7 +7,7 @@ on:
 
 permissions:
   contents: read
-  actions: write       # required to update repository variables
+  actions: write
 
 concurrency:
   group: zangetsu-event-watcher
@@ -117,7 +117,7 @@ jobs:
           def update_variable(new_id):
               repo = os.environ["GITHUB_REPOSITORY"]
               # Try updating existing variable first
-              result = subprocess.run(
+              patch_result = subprocess.run(
                   ["gh", "api", "--method", "PATCH",
                    f"repos/{repo}/actions/variables/LAST_ZANGETSU_EVENT_ID",
                    "-f", "name=LAST_ZANGETSU_EVENT_ID",
@@ -125,17 +125,31 @@ jobs:
                   capture_output=True,
                   text=True
               )
-              if result.returncode != 0:
-                  # Variable doesn't exist yet; create it
-                  subprocess.run(
-                      ["gh", "api", "--method", "POST",
-                       f"repos/{repo}/actions/variables",
-                       "-f", "name=LAST_ZANGETSU_EVENT_ID",
-                       "-f", f"value={new_id}"],
-                      check=True,
-                      capture_output=True
-                  )
-              print(f"Updated variable to {new_id}")
+              if patch_result.returncode == 0:
+                  print(f"Updated variable (PATCH) to {new_id}")
+                  return
+
+              # PATCH failed – print the error and try creation
+              print(f"PATCH failed (exit {patch_result.returncode}):")
+              print(patch_result.stderr.strip())
+
+              # Attempt to create the variable
+              post_result = subprocess.run(
+                  ["gh", "api", "--method", "POST",
+                   f"repos/{repo}/actions/variables",
+                   "-f", "name=LAST_ZANGETSU_EVENT_ID",
+                   "-f", f"value={new_id}"],
+                  capture_output=True,
+                  text=True
+              )
+              if post_result.returncode == 0:
+                  print(f"Created variable (POST) with value {new_id}")
+                  return
+
+              # Both failed – print error and raise
+              print(f"POST also failed (exit {post_result.returncode}):")
+              print(post_result.stderr.strip())
+              raise RuntimeError("Failed to create or update the repository variable.")
 
           sorted_events = sorted(events, key=lambda e: int(e["id"]))
           embeds_to_send = []
