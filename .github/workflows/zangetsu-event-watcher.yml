@@ -53,7 +53,7 @@ jobs:
           set -euo pipefail
 
           python3 - <<'PY'
-          import json, os, subprocess, sys
+          import json, os, subprocess, sys, time
 
           with open("events.json", "r", encoding="utf-8") as f:
               events = json.load(f)
@@ -62,10 +62,11 @@ jobs:
 
           last_id = int(os.environ["LAST_ID"])
           new_last_id = last_id
-          embeds = []
 
           # Sort events by ID (as integers) to process in order
           sorted_events = sorted(events, key=lambda e: int(e["id"]))
+          embeds_to_send = []  # list of (embed, event_id)
+
           for event in sorted_events:
               event_id = int(event["id"])
               if event_id <= last_id:
@@ -107,7 +108,7 @@ jobs:
                       "footer": {"text": repo_name},
                       "timestamp": event["created_at"]
                   }
-                  embeds.append(embed)
+                  embeds_to_send.append((embed, event_id))
 
               elif event["type"] == "ForkEvent":
                   forkee = payload["forkee"]["full_name"]
@@ -119,7 +120,7 @@ jobs:
                       "footer": {"text": repo_name},
                       "timestamp": event["created_at"]
                   }
-                  embeds.append(embed)
+                  embeds_to_send.append((embed, event_id))
 
               elif event["type"] == "WatchEvent":
                   embed = {
@@ -130,7 +131,7 @@ jobs:
                       "footer": {"text": repo_name},
                       "timestamp": event["created_at"]
                   }
-                  embeds.append(embed)
+                  embeds_to_send.append((embed, event_id))
 
               elif event["type"] == "IssuesEvent":
                   issue = payload["issue"]
@@ -147,7 +148,7 @@ jobs:
                       "footer": {"text": repo_name},
                       "timestamp": event["created_at"]
                   }
-                  embeds.append(embed)
+                  embeds_to_send.append((embed, event_id))
 
               elif event["type"] == "IssueCommentEvent":
                   issue = payload["issue"]
@@ -166,7 +167,7 @@ jobs:
                       "footer": {"text": repo_name},
                       "timestamp": event["created_at"]
                   }
-                  embeds.append(embed)
+                  embeds_to_send.append((embed, event_id))
 
               elif event["type"] == "PullRequestEvent":
                   pr = payload["pull_request"]
@@ -183,25 +184,42 @@ jobs:
                       "footer": {"text": repo_name},
                       "timestamp": event["created_at"]
                   }
-                  embeds.append(embed)
+                  embeds_to_send.append((embed, event_id))
 
-          if embeds:
+          # ---- Send each embed as a separate message with a short delay ----
+          sent_count = 0
+          for embed, _ in embeds_to_send:
               payload_json = {
                   "allowed_mentions": {"parse": []},
-                  "embeds": embeds
+                  "embeds": [embed]
               }
-              result = subprocess.run(
-                  ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
-                   "-H", "Content-Type: application/json",
-                   "-X", "POST", "--data", json.dumps(payload_json), os.environ["WEBHOOK"]],
-                  capture_output=True, text=True
-              )
-              if result.returncode != 0 or not result.stdout.startswith("2"):
-                  print(f"Failed to send webhook: HTTP {result.stdout.strip()}", file=sys.stderr)
-                  sys.exit(1)
-              print(f"Sent {len(embeds)} embed(s) for new events.")
+              attempt = 0
+              while attempt < 3:
+                  result = subprocess.run(
+                      ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
+                       "-H", "Content-Type: application/json",
+                       "-X", "POST", "--data", json.dumps(payload_json), os.environ["WEBHOOK"]],
+                      capture_output=True, text=True
+                  )
+                  if result.returncode == 0 and result.stdout.startswith("2"):
+                      sent_count += 1
+                      break
+                  else:
+                      attempt += 1
+                      if attempt < 3:
+                          print(f"Retrying embed (HTTP {result.stdout.strip()})...")
+                          time.sleep(2)
+                      else:
+                          print(f"Failed to send embed after 3 attempts: HTTP {result.stdout.strip()}", file=sys.stderr)
+                          sys.exit(1)
 
-          # Save the new highest event ID (as string) to the state file
+              # Wait 2 seconds between messages to respect Discord rate limits
+              if embed != embeds_to_send[-1][0]:
+                  time.sleep(2)
+
+          print(f"Sent {sent_count} message(s) for new events.")
+
+          # Save the new highest event ID (as string)
           with open("new_last_id.txt", "w") as f:
               f.write(str(new_last_id))
           PY
