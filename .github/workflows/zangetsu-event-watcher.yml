@@ -55,9 +55,18 @@ jobs:
 
           while [ $STOP -eq 0 ]; do
             echo "Fetching page $PAGE..."
-            gh api "repos/$OWNER/$REPO/events?per_page=100&page=$PAGE" > page.json
 
-            # Check if page is empty (no events)
+            # Temporarily disable exit-on-error to handle API errors gracefully
+            set +e
+            gh api "repos/$OWNER/$REPO/events?per_page=100&page=$PAGE" > page.json
+            GH_EXIT=$?
+            set -e
+
+            if [ $GH_EXIT -ne 0 ]; then
+              echo "GitHub API returned an error (probably hit pagination limit). Stopping fetching."
+              break
+            fi
+
             EVENTS_COUNT="$(jq '. | length' page.json)"
             if [ "$EVENTS_COUNT" -eq 0 ]; then
               echo "No more events. Stopping."
@@ -68,26 +77,20 @@ jobs:
             jq -s '.[0] + .[1]' new_events.json page.json > merged.json
             mv merged.json new_events.json
 
-            # Get the smallest event ID on this page
-            MIN_ID="$(jq 'min_by(.id) | .id' page.json)"
+            # Get the smallest event ID on this page (as a raw number)
+            MIN_ID="$(jq -r '[.[].id | tonumber] | min' page.json)"
 
             # If any event on this page has an ID <= LAST_ID, we've reached already processed events
-            if [ "$MIN_ID" != "null" ]; then
-              if [ "$MIN_ID" -le "$LAST_ID" ]; then
-                echo "Reached events older than last processed ID ($LAST_ID). Stopping."
-                STOP=1
-              fi
-            else
-              # No events? shouldn't happen because we checked count, but just in case
-              echo "No valid IDs on this page."
-              break
+            if [ "$MIN_ID" -le "$LAST_ID" ]; then
+              echo "Reached events older than last processed ID ($LAST_ID). Stopping."
+              STOP=1
             fi
 
             PAGE=$((PAGE + 1))
             # Safety: stop after 10 pages to avoid infinite loop
             if [ $PAGE -gt 10 ]; then
               echo "Reached maximum pages (10). Stopping."
-              break
+              STOP=1
             fi
           done
 
@@ -109,7 +112,6 @@ jobs:
           last_id = int(os.environ["LAST_ID"])
           new_last_id = last_id
 
-          # Sort events by ID (ascending) to process in order
           sorted_events = sorted(events, key=lambda e: int(e["id"]))
           embeds_to_send = []
 
