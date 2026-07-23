@@ -32,10 +32,11 @@ jobs:
         run: |
           set -euo pipefail
           if [ -f "$STATE_FILE" ]; then
-            echo "id=$(tr -d '\r\n' < "$STATE_FILE")" >> "$GITHUB_OUTPUT"
+            LAST_ID="$(tr -d '\r\n' < "$STATE_FILE")"
           else
-            echo "id=0" >> "$GITHUB_OUTPUT"
+            LAST_ID="0"
           fi
+          echo "id=$LAST_ID" >> "$GITHUB_OUTPUT"
 
       - name: Fetch recent repository events
         env:
@@ -59,24 +60,26 @@ jobs:
 
           EVENT_TYPES = {"PushEvent", "ForkEvent", "WatchEvent", "IssuesEvent", "IssueCommentEvent", "PullRequestEvent"}
 
-          last_id = os.environ["LAST_ID"]
+          last_id = int(os.environ["LAST_ID"])
           new_last_id = last_id
           embeds = []
 
-          for event in sorted(events, key=lambda e: e["id"]):
-              if event["id"] <= last_id:
+          # Sort events by ID (as integers) to process in order
+          sorted_events = sorted(events, key=lambda e: int(e["id"]))
+          for event in sorted_events:
+              event_id = int(event["id"])
+              if event_id <= last_id:
                   continue
               if event["type"] not in EVENT_TYPES:
                   continue
 
-              new_last_id = max(new_last_id, event["id"])
+              new_last_id = max(new_last_id, event_id)
               actor = event["actor"]
               avatar_url = actor["avatar_url"] + "&s=80"
               actor_name = actor["display_login"]
               payload = event.get("payload", {})
               repo_name = event["repo"]["name"]
 
-              # ---- PushEvent (commits) - one embed per push ----
               if event["type"] == "PushEvent":
                   ref = payload.get("ref", "").replace("refs/heads/", "")
                   commits = payload.get("commits", [])
@@ -106,7 +109,6 @@ jobs:
                   }
                   embeds.append(embed)
 
-              # ---- ForkEvent ----
               elif event["type"] == "ForkEvent":
                   forkee = payload["forkee"]["full_name"]
                   embed = {
@@ -119,7 +121,6 @@ jobs:
                   }
                   embeds.append(embed)
 
-              # ---- WatchEvent (star) ----
               elif event["type"] == "WatchEvent":
                   embed = {
                       "author": {"name": actor_name, "icon_url": avatar_url},
@@ -131,7 +132,6 @@ jobs:
                   }
                   embeds.append(embed)
 
-              # ---- IssuesEvent ----
               elif event["type"] == "IssuesEvent":
                   issue = payload["issue"]
                   action = payload["action"]
@@ -149,7 +149,6 @@ jobs:
                   }
                   embeds.append(embed)
 
-              # ---- IssueCommentEvent ----
               elif event["type"] == "IssueCommentEvent":
                   issue = payload["issue"]
                   comment = payload["comment"]
@@ -169,7 +168,6 @@ jobs:
                   }
                   embeds.append(embed)
 
-              # ---- PullRequestEvent ----
               elif event["type"] == "PullRequestEvent":
                   pr = payload["pull_request"]
                   action = payload["action"]
@@ -187,7 +185,6 @@ jobs:
                   }
                   embeds.append(embed)
 
-          # Send all embeds in one message
           if embeds:
               payload_json = {
                   "allowed_mentions": {"parse": []},
@@ -204,18 +201,41 @@ jobs:
                   sys.exit(1)
               print(f"Sent {len(embeds)} embed(s) for new events.")
 
-          # Save latest event ID
+          # Save the new highest event ID (as string) to the state file
           with open("new_last_id.txt", "w") as f:
-              f.write(new_last_id)
+              f.write(str(new_last_id))
           PY
 
       - name: Save latest event ID
         run: |
           set -euo pipefail
+
           mkdir -p .state
           cp new_last_id.txt "$STATE_FILE"
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "$STATE_FILE"
-          git commit -m "Update last event ID" || exit 0
-          git push
+
+          # Force-add to bypass .gitignore
+          git add -f "$STATE_FILE"
+
+          # Only commit if there's something to commit
+          if git diff --cached --quiet; then
+            echo "State file unchanged, nothing to commit."
+            exit 0
+          fi
+
+          git commit -m "Update last event ID"
+
+          # Push with retry
+          for i in 1 2 3; do
+            echo "Push attempt $i..."
+            if git push origin HEAD; then
+              echo "Push successful."
+              exit 0
+            fi
+            sleep 5
+          done
+
+          echo "::error::Push failed after 3 attempts."
+          exit 1
