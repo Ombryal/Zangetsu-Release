@@ -1,0 +1,277 @@
+name: Zangetsu Release Watcher
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/10 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: zangetsu-release-watcher
+  cancel-in-progress: true
+
+env:
+  OWNER: Spyou
+  REPO: Zangetsu
+  STATE_FILE: .state/latest_release.txt
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch latest release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api repos/$OWNER/$REPO/releases/latest > release.json
+
+          TAG="$(jq -r '.tag_name' release.json)"
+          NAME="$(jq -r '.name // .tag_name' release.json)"
+          URL="$(jq -r '.html_url' release.json)"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Read previous release
+        id: previous
+        run: |
+          set -euo pipefail
+          if [ -f "$STATE_FILE" ]; then
+            echo "tag=$(tr -d '\r\n' < "$STATE_FILE")" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stop if already announced
+        if: steps.release.outputs.tag == steps.previous.outputs.tag
+        run: |
+          echo "Already posted."
+          exit 0
+
+      # ------------------------- AI REFINEMENT (Groq) -------------------------
+      - name: Refine release notes with Groq
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          RAW_BODY="$(jq -r '.body // ""' release.json)"
+          if [ -z "$RAW_BODY" ]; then
+            echo "No release notes to refine."
+            touch refined_body.txt
+            exit 0
+          fi
+
+          CLEAN_BODY="$(echo "$RAW_BODY" | grep -v "Don't know which version to download?" || true)"
+          if [ -z "$CLEAN_BODY" ]; then
+            echo "Release notes empty after cleaning."
+            touch refined_body.txt
+            exit 0
+          fi
+
+          # Stronger prompt that forces restructuring
+          PROMPT="Reformat the following release notes into three clearly labelled markdown sections. Use exactly these headings:
+          ✨ Features
+          🔧 Improvements
+          🐛 Fixes
+
+          Summarise each point concisely. Output only the reformatted notes and nothing else.
+
+          Original notes:
+          ${CLEAN_BODY}"
+
+          ESCAPED_PROMPT="$(echo "$PROMPT" | jq -Rs .)"
+
+          HTTP_CODE="$(curl -s -o /tmp/groq_response.json -w "%{http_code}" \
+            "https://api.groq.com/openai/v1/chat/completions" \
+            -H "Authorization: Bearer ${GROQ_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"model\": \"llama-3.1-8b-instant\",
+              \"messages\": [{\"role\": \"user\", \"content\": ${ESCAPED_PROMPT}}],
+              \"temperature\": 0.3
+            }")"
+
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "Groq API returned HTTP $HTTP_CODE, falling back to raw notes."
+            printf '%s' "$CLEAN_BODY" > refined_body.txt
+            exit 0
+          fi
+
+          REFINED="$(jq -r '.choices[0].message.content // empty' /tmp/groq_response.json)"
+          if [ -z "$REFINED" ]; then
+            echo "Could not parse Groq response, falling back to raw notes."
+            printf '%s' "$CLEAN_BODY" > refined_body.txt
+          else
+            printf '%s' "$REFINED" > refined_body.txt
+            echo "Successfully refined notes with Groq."
+          fi
+
+      # ------------------------- BUILD PAYLOADS -------------------------
+      - name: Build Discord payloads
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+
+          with open("release.json", "r", encoding="utf-8") as f:
+              release = json.load(f)
+
+          tag = release.get("tag_name", "")
+          name = release.get("name") or tag
+          url = release.get("html_url", "")
+          prerelease = bool(release.get("prerelease")) or "beta" in tag.lower()
+
+          # Use refined body if available, otherwise raw
+          body = ""
+          try:
+              with open("refined_body.txt", "r", encoding="utf-8") as f:
+                  body = f.read().strip()
+          except FileNotFoundError:
+              body = ""
+
+          if not body:
+              # Fallback to original release body
+              body = release.get("body") or ""
+              cleaned = []
+              for line in body.splitlines():
+                  if "Don't know which version to download?" in line:
+                      continue
+                  cleaned.append(line)
+              body = "\n".join(cleaned).strip()
+
+          def apk_label(asset_name: str) -> str | None:
+              n = asset_name.lower()
+              if not n.endswith(".apk"):
+                  return None
+              if "arm64-v8a" in n:
+                  return "APK (arm64)"
+              if "armeabi-v7a" in n:
+                  return "APK (armeabi-v7a)"
+              if "tv" in n:
+                  return "APK (TV)"
+              if "universal" in n:
+                  return "APK (universal)"
+              return None
+
+          assets = release.get("assets", [])
+          apk_lines = []
+
+          for asset in assets:
+              asset_name = asset.get("name", "download")
+              label = apk_label(asset_name)
+              if not label:
+                  continue
+
+              size_mb = asset.get("size", 0) / (1024 * 1024)
+              asset_url = asset.get("browser_download_url", "")
+              apk_lines.append(
+                  f"🔹 [Download | {size_mb:.2f} MB | {label}]({asset_url})"
+              )
+
+          description_parts = []
+          if prerelease:
+              description_parts.append(
+                  "⚠️ **BETA WARNING**\n"
+                  "This is a Beta Release. Features and fixes in this version are still under testing and may contain bugs or unexpected behavior. "
+                  "Please report any issues you encounter. Do not use in production."
+              )
+          if body:
+              description_parts.append(body)
+
+          description = "\n\n".join(description_parts).strip()
+          if not description:
+              description = " "
+
+          max_bytes = 3900
+          if len(description.encode("utf-8")) > max_bytes:
+              desc_bytes = description.encode("utf-8")[:max_bytes-3]
+              description = desc_bytes.decode("utf-8", "ignore").rstrip() + "..."
+
+          embed_payload = {
+              "allowed_mentions": {"parse": []},
+              "content": "",
+              "embeds": [{
+                  "title": f"New Release: {name}",
+                  "url": url,
+                  "description": description,
+                  "color": 5814783,
+                  "footer": {
+                      "text": f"Version {tag}"
+                  }
+              }]
+          }
+
+          with open("payload_embed.json", "w", encoding="utf-8") as f:
+              json.dump(embed_payload, f, ensure_ascii=False)
+
+          if apk_lines:
+              content = "**APK Downloads**\n" + "\n".join(apk_lines)
+              apk_payload = {
+                  "allowed_mentions": {"parse": []},
+                  "content": content,
+                  "embeds": []
+              }
+              with open("payload_apk.json", "w", encoding="utf-8") as f:
+                  json.dump(apk_payload, f, ensure_ascii=False)
+          PY
+
+      - name: Send Discord messages
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+
+          send_payload() {
+            local payload_file="$1"
+            local description="$2"
+
+            http_code="$(curl -sS \
+              -o /tmp/discord_response.txt \
+              -w "%{http_code}" \
+              -H "Content-Type: application/json" \
+              -A "Zangetsu-Release-Watcher/1.0" \
+              -X POST \
+              --data "@${payload_file}" \
+              "$WEBHOOK")"
+
+            echo "${description} HTTP status: $http_code"
+            cat /tmp/discord_response.txt || true
+
+            if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+              echo "::error::${description} failed with HTTP $http_code"
+              exit 1
+            fi
+          }
+
+          send_payload "payload_embed.json" "Embed message"
+
+          if [ -f "payload_apk.json" ]; then
+            send_payload "payload_apk.json" "APK message"
+          fi
+
+      - name: Save latest tag
+        run: |
+          set -euo pipefail
+
+          mkdir -p .state
+          printf '%s\n' "${{ steps.release.outputs.tag }}" > "$STATE_FILE"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "$STATE_FILE"
+          git commit -m "Update latest release" || exit 0
+          git push
