@@ -56,14 +56,13 @@ jobs:
           while [ $STOP -eq 0 ]; do
             echo "Fetching page $PAGE..."
 
-            # Temporarily disable exit-on-error to handle API errors gracefully
             set +e
             gh api "repos/$OWNER/$REPO/events?per_page=100&page=$PAGE" > page.json
             GH_EXIT=$?
             set -e
 
             if [ $GH_EXIT -ne 0 ]; then
-              echo "GitHub API returned an error (probably hit pagination limit). Stopping fetching."
+              echo "GitHub API returned an error (probably hit pagination limit). Stopping."
               break
             fi
 
@@ -73,21 +72,17 @@ jobs:
               break
             fi
 
-            # Concatenate events into new_events.json
             jq -s '.[0] + .[1]' new_events.json page.json > merged.json
             mv merged.json new_events.json
 
-            # Get the smallest event ID on this page (as a raw number)
             MIN_ID="$(jq -r '[.[].id | tonumber] | min' page.json)"
 
-            # If any event on this page has an ID <= LAST_ID, we've reached already processed events
             if [ "$MIN_ID" -le "$LAST_ID" ]; then
               echo "Reached events older than last processed ID ($LAST_ID). Stopping."
               STOP=1
             fi
 
             PAGE=$((PAGE + 1))
-            # Safety: stop after 10 pages to avoid infinite loop
             if [ $PAGE -gt 10 ]; then
               echo "Reached maximum pages (10). Stopping."
               STOP=1
@@ -235,12 +230,13 @@ jobs:
                   embeds_to_send.append((embed, event_id))
 
           sent_count = 0
-          for embed, _ in embeds_to_send:
+          for i, (embed, _) in enumerate(embeds_to_send):
               payload_json = {
                   "allowed_mentions": {"parse": []},
                   "embeds": [embed]
               }
               attempt = 0
+              success = False
               while attempt < 3:
                   result = subprocess.run(
                       ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
@@ -250,21 +246,27 @@ jobs:
                   )
                   if result.returncode == 0 and result.stdout.startswith("2"):
                       sent_count += 1
+                      success = True
                       break
                   else:
+                      http_code = result.stdout.strip()
+                      print(f"HTTP {http_code} on attempt {attempt+1}")
                       attempt += 1
                       if attempt < 3:
-                          print(f"Retrying embed (HTTP {result.stdout.strip()})...")
-                          time.sleep(2)
-                      else:
-                          print(f"Failed to send embed after 3 attempts: HTTP {result.stdout.strip()}", file=sys.stderr)
-                          sys.exit(1)
+                          time.sleep(5)
+              if not success:
+                  print(f"Failed to send embed after 3 attempts. Last HTTP status: {http_code}", file=sys.stderr)
+                  # Do not exit; save what we have so far and let the next run continue
+                  break
 
-              if embed != embeds_to_send[-1][0]:
-                  time.sleep(2)
+              # Wait 4 minutes (240 seconds) before sending the next message, unless it's the last one
+              if i < len(embeds_to_send) - 1:
+                  print("Waiting 4 minutes before next message...")
+                  time.sleep(240)
 
           print(f"Sent {sent_count} message(s) for new events.")
 
+          # Save the highest event ID that we successfully sent (or attempted)
           with open("new_last_id.txt", "w") as f:
               f.write(str(new_last_id))
           PY
