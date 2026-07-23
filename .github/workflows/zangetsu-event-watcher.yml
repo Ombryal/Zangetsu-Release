@@ -6,7 +6,7 @@ on:
     - cron: "*/5 * * * *"
 
 permissions:
-  contents: write      # for force-pushing the state file
+  contents: read   # we only fetch public events, no push
 
 concurrency:
   group: zangetsu-event-watcher
@@ -15,35 +15,29 @@ concurrency:
 env:
   OWNER: Spyou
   REPO: Zangetsu
-  STATE_FILE: .state/last_event_id.txt
 
 jobs:
   watch-events:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout this repo
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Read last processed event ID
+      - name: Read last processed event ID (from variable)
         id: last_event
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}          # use PAT to read the variable
         run: |
           set -euo pipefail
-          if [ -f "$STATE_FILE" ]; then
-            LAST_ID="$(tr -d '\r\n' < "$STATE_FILE")"
-            if [ -z "$LAST_ID" ]; then
-              LAST_ID="0"
-            fi
+          if LAST_ID="$(gh api "repos/${{ github.repository }}/actions/variables/LAST_ZANGETSU_EVENT_ID" --jq '.value' 2>/dev/null)"; then
+            echo "Last processed event ID: $LAST_ID"
+            echo "id=$LAST_ID" >> "$GITHUB_OUTPUT"
           else
-            LAST_ID="0"
+            echo "Variable not found, starting from 0."
+            echo "id=0" >> "$GITHUB_OUTPUT"
           fi
-          echo "id=$LAST_ID" >> "$GITHUB_OUTPUT"
 
       - name: Fetch all new repository events (paginated)
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}              # public events, default token is fine
           LAST_ID: ${{ steps.last_event.outputs.id }}
         run: |
           set -euo pipefail
@@ -81,13 +75,15 @@ jobs:
             fi
           done
 
-      - name: Process new events and send to Discord
+      - name: Process new events and send to Discord (resumable)
         env:
           WEBHOOK_1: ${{ secrets.DISCORD_EVENTS_WEBHOOK_URL_1 }}
           WEBHOOK_2: ${{ secrets.DISCORD_EVENTS_WEBHOOK_URL_2 }}
           LAST_ID: ${{ steps.last_event.outputs.id }}
+          GH_TOKEN: ${{ secrets.GH_PAT }}          # PAT for variable operations
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
           import json, os, subprocess, sys, time
 
@@ -107,11 +103,34 @@ jobs:
               print("No webhook URLs configured. Exiting.")
               sys.exit(0)
 
-          # Helper to write the latest sent ID to a file (for later Git commit)
-          def save_progress(new_id):
-              with open("latest_sent_id.txt", "w") as f:
-                  f.write(str(new_id))
-              print(f"Saved progress: {new_id}")
+          def update_variable(new_id):
+              repo = os.environ["GITHUB_REPOSITORY"]
+              # Try PATCH first (variable already exists)
+              patch = subprocess.run(
+                  ["gh", "api", "--method", "PATCH",
+                   f"repos/{repo}/actions/variables/LAST_ZANGETSU_EVENT_ID",
+                   "-f", "name=LAST_ZANGETSU_EVENT_ID",
+                   "-f", f"value={new_id}"],
+                  capture_output=True, text=True
+              )
+              if patch.returncode == 0:
+                  print(f"Updated variable to {new_id}")
+                  return
+
+              # PATCH failed (likely 404) – create via POST
+              print(f"PATCH failed, creating variable. Error: {patch.stderr.strip()}")
+              post = subprocess.run(
+                  ["gh", "api", "--method", "POST",
+                   f"repos/{repo}/actions/variables",
+                   "-f", "name=LAST_ZANGETSU_EVENT_ID",
+                   "-f", f"value={new_id}"],
+                  capture_output=True, text=True
+              )
+              if post.returncode == 0:
+                  print(f"Created variable with {new_id}")
+                  return
+              print(f"POST also failed: {post.stderr.strip()}")
+              raise RuntimeError("Cannot update or create variable.")
 
           sorted_events = sorted(events, key=lambda e: int(e["id"]))
           embeds_to_send = []
@@ -129,6 +148,7 @@ jobs:
               repo_name = event["repo"]["name"]
               repo_url = f"https://github.com/{repo_name}"
 
+              # PushEvent
               if event["type"] == "PushEvent":
                   ref = payload.get("ref", "").replace("refs/heads/", "")
                   commits = payload.get("commits", [])
@@ -142,15 +162,18 @@ jobs:
                   embed = {"author":{"name":actor_name,"icon_url":avatar_url},"title":title,"url":branch_url,"description":"\n".join(commit_lines),"color":0x57A9FF,"footer":{"text":repo_name},"timestamp":event["created_at"]}
                   embeds_to_send.append((embed, event_id))
 
+              # ForkEvent
               elif event["type"] == "ForkEvent":
                   forkee = payload["forkee"]["full_name"]
                   embed = {"author":{"name":actor_name,"icon_url":avatar_url},"title":f"[{repo_name}] Fork created: {forkee}","url":f"https://github.com/{forkee}","color":0xFFAC33,"footer":{"text":repo_name},"timestamp":event["created_at"]}
                   embeds_to_send.append((embed, event_id))
 
+              # WatchEvent
               elif event["type"] == "WatchEvent":
                   embed = {"author":{"name":actor_name,"icon_url":avatar_url},"title":f"[{repo_name}] New star added","url":repo_url,"color":0xFFD700,"footer":{"text":repo_name},"timestamp":event["created_at"]}
                   embeds_to_send.append((embed, event_id))
 
+              # IssuesEvent
               elif event["type"] == "IssuesEvent":
                   issue = payload["issue"]
                   action = payload["action"]
@@ -159,6 +182,7 @@ jobs:
                   embed = {"author":{"name":actor_name,"icon_url":avatar_url},"title":f"[{repo_name}] Issue {action}: #{issue['number']} {issue['title']}","url":issue["html_url"],"description":body,"color":color,"footer":{"text":repo_name},"timestamp":event["created_at"]}
                   embeds_to_send.append((embed, event_id))
 
+              # IssueCommentEvent
               elif event["type"] == "IssueCommentEvent":
                   issue = payload["issue"]
                   comment = payload["comment"]
@@ -166,6 +190,7 @@ jobs:
                   embed = {"author":{"name":actor_name,"icon_url":avatar_url},"title":f"[{repo_name}] New comment on issue #{issue['number']}: {issue['title']}","url":comment["html_url"],"description":body,"color":0x5865F2,"footer":{"text":repo_name},"timestamp":event["created_at"]}
                   embeds_to_send.append((embed, event_id))
 
+              # PullRequestEvent
               elif event["type"] == "PullRequestEvent":
                   pr = payload["pull_request"]
                   action = payload["action"]
@@ -190,54 +215,12 @@ jobs:
                   print(f"Failed to send embed for event {event_id}. Stopping.")
                   break
 
-              # Save progress immediately after each successful send
               latest_sent_id = event_id
-              save_progress(latest_sent_id)
+              update_variable(latest_sent_id)     # NOW WORKS WITH PAT
 
               if i < len(embeds_to_send)-1:
                   print("Waiting 4 minutes...")
                   time.sleep(240)
 
-          # Write the final latest ID again (in case loop finished)
-          save_progress(latest_sent_id)
           print(f"Sent {sent_count} message(s).")
           PY
-
-      - name: Save latest event ID to repository
-        run: |
-          set -euo pipefail
-
-          # If no progress file exists, skip (no events were sent)
-          if [ ! -f latest_sent_id.txt ]; then
-            echo "No events processed, nothing to save."
-            exit 0
-          fi
-
-          mkdir -p .state
-          cp latest_sent_id.txt "$STATE_FILE"
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # Force-add to bypass any .gitignore
-          git add -f "$STATE_FILE"
-
-          if git diff --cached --quiet; then
-            echo "State file unchanged, nothing to commit."
-            exit 0
-          fi
-
-          git commit -m "Update last event ID"
-
-          # Push with retry
-          for i in 1 2 3; do
-            echo "Push attempt $i..."
-            if git push origin HEAD; then
-              echo "Push successful."
-              exit 0
-            fi
-            sleep 5
-          done
-
-          echo "::error::Push failed after 3 attempts."
-          exit 1
