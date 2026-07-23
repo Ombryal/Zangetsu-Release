@@ -79,18 +79,19 @@ jobs:
             exit 0
           fi
 
-          PROMPT="You are a release notes formatter. Reformat the following raw release notes into exactly these three sections using Markdown level-2 headings:
+          PROMPT="You are a release notes categoriser. Your ONLY task is to reorganise the original changelog items into three sections. Do NOT rewrite, rephrase, or create new wording. Use the exact same bullet points as provided, just place them under the correct heading.
+
+          Use these Markdown level-2 headings:
           ## ✨ Features
           ## 🔧 Improvements
           ## 🐛 Fixes
 
-          Strict rules:
-          - Categorise every bullet point from the original notes into the correct section. Features are new capabilities, Improvements are enhancements or changes to existing things, Fixes are bug resolutions.
-          - If the original notes contain a line like \"Plus fixes:\", extract those items and place them under ## 🐛 Fixes.
-          - Do NOT add any horizontal lines, dashes, or separator characters.
-          - Write each section as a plain bullet list (using - or •).
-          - If a section has zero items, COMPLETELY REMOVE that section — do not output its heading or the word 'None'.
-          - Output only the reformatted notes. No introductory or concluding text.
+          Rules:
+          - Categorise each bullet point from the original notes into Features (new capabilities), Improvements (enhancements to existing things), or Fixes (bug resolutions).
+          - If the original notes contain a line like \"Plus fixes:\" or similar, extract those items and place them directly under ## 🐛 Fixes without changing their text.
+          - Keep every original bullet point exactly as it appears — do not change words, remove emojis, or condense.
+          - If a section would have zero items, OMIT the entire section (both the heading and any placeholder text like 'None').
+          - Output ONLY the reorganised notes. No introductory or concluding text.
 
           Original notes:
           ${CLEAN_BODY}"
