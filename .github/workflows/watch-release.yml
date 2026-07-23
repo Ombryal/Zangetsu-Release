@@ -80,10 +80,10 @@ jobs:
             exit 0
           fi
 
-          PROMPT="You are a release notes formatter. Reformat the following release notes into exactly three short sections. Use these exact bold headings (with double asterisks):
-          **✨ Features**
-          **🔧 Improvements**
-          **🐛 Fixes**
+          PROMPT="You are a release notes formatter. Reformat the following release notes into exactly three sections using Markdown level-2 headings (##). Use these exact heading lines:
+          ## ✨ Features
+          ## 🔧 Improvements
+          ## 🐛 Fixes
           Rules:
           - Do NOT add any horizontal lines, dashes, or separator characters.
           - Write each section as a plain bullet list (using - or •).
@@ -149,7 +149,7 @@ jobs:
                   cleaned.append(line)
               body = "\n".join(cleaned).strip()
 
-          # ---- Build description with beta warning if needed ----
+          # Build description with beta warning and body
           description_parts = []
           if prerelease:
               description_parts.append(
@@ -163,17 +163,17 @@ jobs:
           if not description:
               description = " "
 
-          # Truncate to 3900 bytes safe
+          # Safe truncation to 3900 bytes
           max_bytes = 3900
           if len(description.encode("utf-8")) > max_bytes:
               desc_bytes = description.encode("utf-8")[:max_bytes-3]
               description = desc_bytes.decode("utf-8", "ignore").rstrip() + "..."
 
-          # ---- Role ping (optional) ----
+          # Role ping (optional)
           role_id = os.environ.get("DISCORD_ROLE_ID", "").strip()
           content = f"<@&{role_id}>" if role_id else ""
 
-          # ---- Embed payload (single embed) ----
+          # Single embed payload with markdown headings
           embed_payload = {
               "allowed_mentions": {"parse": []},
               "content": content,
@@ -260,10 +260,10 @@ jobs:
             fi
           }
 
-          # 1. Send the embed message (with optional role ping)
+          # 1. Send the single embed message (with role ping if set)
           send_payload "payload_embed.json" "Embed message"
 
-          # 2. Send the APK message if it exists
+          # 2. Send APK message after
           if [ -f "payload_apk.json" ]; then
             send_payload "payload_apk.json" "APK message"
           fi
