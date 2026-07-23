@@ -115,14 +115,25 @@ jobs:
 
           def update_variable(new_id):
               repo = os.environ["GITHUB_REPOSITORY"]
-              subprocess.run(
+              # Try updating existing variable first
+              result = subprocess.run(
                   ["gh", "api", "--method", "PATCH",
                    f"repos/{repo}/actions/variables/LAST_ZANGETSU_EVENT_ID",
                    "-f", "name=LAST_ZANGETSU_EVENT_ID",
                    "-f", f"value={new_id}"],
-                  check=True,
-                  capture_output=True
+                  capture_output=True,
+                  text=True
               )
+              if result.returncode != 0:
+                  # Variable probably doesn't exist yet; create it
+                  subprocess.run(
+                      ["gh", "api", "--method", "POST",
+                       f"repos/{repo}/actions/variables",
+                       "-f", "name=LAST_ZANGETSU_EVENT_ID",
+                       "-f", f"value={new_id}"],
+                      check=True,
+                      capture_output=True
+                  )
               print(f"Updated variable to {new_id}")
 
           sorted_events = sorted(events, key=lambda e: int(e["id"]))
@@ -139,7 +150,7 @@ jobs:
               avatar_url = actor["avatar_url"] + "&s=80"
               actor_name = actor["display_login"]
               payload = event.get("payload", {})
-              repo_name = event["repo"]["name"]          # "Spyou/Zangetsu"
+              repo_name = event["repo"]["name"]
               repo_url = f"https://github.com/{repo_name}"
 
               # ---- PushEvent (commits) ----
