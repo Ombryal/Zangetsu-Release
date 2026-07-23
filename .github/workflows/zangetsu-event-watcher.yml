@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  actions: write       # required to update repository variables
 
 concurrency:
   group: zangetsu-event-watcher
@@ -125,7 +126,7 @@ jobs:
                   text=True
               )
               if result.returncode != 0:
-                  # Variable probably doesn't exist yet; create it
+                  # Variable doesn't exist yet; create it
                   subprocess.run(
                       ["gh", "api", "--method", "POST",
                        f"repos/{repo}/actions/variables",
