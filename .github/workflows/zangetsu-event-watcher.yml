@@ -6,11 +6,11 @@ on:
     - cron: "*/5 * * * *"
 
 permissions:
-  contents: read   # we only need to read the variable, not push
+  contents: read
 
 concurrency:
   group: zangetsu-event-watcher
-  cancel-in-progress: true   # still cancel if a new run starts, but with variable updates the next run will resume correctly
+  cancel-in-progress: true
 
 env:
   OWNER: Spyou
@@ -83,7 +83,7 @@ jobs:
             fi
           done
 
-      - name: Process new events and send to Discord (resumable, variable-updated)
+      - name: Process new events and send to Discord (resumable, variable‑updated)
         env:
           WEBHOOK_1: ${{ secrets.DISCORD_EVENTS_WEBHOOK_URL_1 }}
           WEBHOOK_2: ${{ secrets.DISCORD_EVENTS_WEBHOOK_URL_2 }}
@@ -101,7 +101,7 @@ jobs:
           EVENT_TYPES = {"PushEvent", "ForkEvent", "WatchEvent", "IssuesEvent", "IssueCommentEvent", "PullRequestEvent"}
 
           last_id = int(os.environ["LAST_ID"])
-          latest_sent_id = last_id   # will be updated after each successful send
+          latest_sent_id = last_id
 
           webhooks = []
           for key in ("WEBHOOK_1", "WEBHOOK_2"):
@@ -113,10 +113,8 @@ jobs:
               print("No webhook URLs configured. Exiting.")
               sys.exit(0)
 
-          # Helper to update the repository variable
           def update_variable(new_id):
               repo = os.environ["GITHUB_REPOSITORY"]
-              # Use gh api to PATCH the variable
               subprocess.run(
                   ["gh", "api", "--method", "PATCH",
                    f"repos/{repo}/actions/variables/LAST_ZANGETSU_EVENT_ID",
@@ -130,7 +128,6 @@ jobs:
           sorted_events = sorted(events, key=lambda e: int(e["id"]))
           embeds_to_send = []
 
-          # Build list of (embed, event_id) for all new events
           for event in sorted_events:
               event_id = int(event["id"])
               if event_id <= last_id:
@@ -142,23 +139,30 @@ jobs:
               avatar_url = actor["avatar_url"] + "&s=80"
               actor_name = actor["display_login"]
               payload = event.get("payload", {})
-              repo_name = event["repo"]["name"]
+              repo_name = event["repo"]["name"]          # "Spyou/Zangetsu"
+              repo_url = f"https://github.com/{repo_name}"
 
+              # ---- PushEvent (commits) ----
               if event["type"] == "PushEvent":
                   ref = payload.get("ref", "").replace("refs/heads/", "")
                   commits = payload.get("commits", [])
                   if not commits:
                       continue
 
+                  branch_url = f"{repo_url}/tree/{ref}"
                   commit_lines = []
                   for c in commits:
-                      sha = c["sha"][:7]
+                      full_sha = c["sha"]
+                      short_sha = full_sha[:7]
                       msg = c["message"].split("\n")[0]
                       author = c["author"]["name"]
-                      commit_lines.append(f"`{sha}` {msg} — **{author}**")
+                      commit_url = f"{repo_url}/commit/{full_sha}"
+                      commit_lines.append(
+                          f"[`{short_sha}`]({commit_url}) {msg} — **{author}**"
+                      )
 
                   commit_count = len(commits)
-                  title = f"📦 [{ref}] {commit_count} new commit{'s' if commit_count > 1 else ''}"
+                  title = f"[{repo_name}:{ref}] {commit_count} new commit{'s' if commit_count > 1 else ''}"
 
                   embed = {
                       "author": {
@@ -166,6 +170,7 @@ jobs:
                           "icon_url": avatar_url
                       },
                       "title": title,
+                      "url": branch_url,
                       "description": "\n".join(commit_lines),
                       "color": 0x57A9FF,
                       "footer": {"text": repo_name},
@@ -173,76 +178,94 @@ jobs:
                   }
                   embeds_to_send.append((embed, event_id))
 
+              # ---- ForkEvent ----
               elif event["type"] == "ForkEvent":
                   forkee = payload["forkee"]["full_name"]
+                  forkee_url = f"https://github.com/{forkee}"
                   embed = {
                       "author": {"name": actor_name, "icon_url": avatar_url},
-                      "title": "🍴 New Fork",
-                      "description": f"**{forkee}**",
+                      "title": f"[{repo_name}] Fork created: {forkee}",
+                      "url": forkee_url,
                       "color": 0xFFAC33,
                       "footer": {"text": repo_name},
                       "timestamp": event["created_at"]
                   }
                   embeds_to_send.append((embed, event_id))
 
+              # ---- WatchEvent (star) ----
               elif event["type"] == "WatchEvent":
                   embed = {
                       "author": {"name": actor_name, "icon_url": avatar_url},
-                      "title": "⭐ New Star",
-                      "description": f"{actor_name} starred the repository",
+                      "title": f"[{repo_name}] New star added",
+                      "url": repo_url,
                       "color": 0xFFD700,
                       "footer": {"text": repo_name},
                       "timestamp": event["created_at"]
                   }
                   embeds_to_send.append((embed, event_id))
 
+              # ---- IssuesEvent ----
               elif event["type"] == "IssuesEvent":
                   issue = payload["issue"]
                   action = payload["action"]
-                  title = issue["title"]
-                  number = issue["number"]
-                  url = issue["html_url"]
+                  issue_title = issue["title"]
+                  issue_number = issue["number"]
+                  issue_url = issue["html_url"]
+                  issue_body = issue.get("body") or ""
+                  if len(issue_body) > 500:
+                      issue_body = issue_body[:497] + "..."
+
                   color = 0xED4245 if action in ["opened", "reopened"] else 0x57F287
                   embed = {
                       "author": {"name": actor_name, "icon_url": avatar_url},
-                      "title": f"Issue {action}: {title} (#{number})",
-                      "url": url,
+                      "title": f"[{repo_name}] Issue {action}: #{issue_number} {issue_title}",
+                      "url": issue_url,
+                      "description": issue_body,
                       "color": color,
                       "footer": {"text": repo_name},
                       "timestamp": event["created_at"]
                   }
                   embeds_to_send.append((embed, event_id))
 
+              # ---- IssueCommentEvent ----
               elif event["type"] == "IssueCommentEvent":
                   issue = payload["issue"]
                   comment = payload["comment"]
                   issue_title = issue["title"]
                   issue_number = issue["number"]
+                  comment_url = comment["html_url"]
                   comment_body = comment["body"]
                   if len(comment_body) > 500:
                       comment_body = comment_body[:497] + "..."
+
                   embed = {
                       "author": {"name": actor_name, "icon_url": avatar_url},
-                      "title": f"💬 Comment on #{issue_number}: {issue_title}",
+                      "title": f"[{repo_name}] New comment on issue #{issue_number}: {issue_title}",
+                      "url": comment_url,
                       "description": comment_body,
-                      "url": comment["html_url"],
                       "color": 0x5865F2,
                       "footer": {"text": repo_name},
                       "timestamp": event["created_at"]
                   }
                   embeds_to_send.append((embed, event_id))
 
+              # ---- PullRequestEvent ----
               elif event["type"] == "PullRequestEvent":
                   pr = payload["pull_request"]
                   action = payload["action"]
-                  title = pr["title"]
-                  number = pr["number"]
-                  url = pr["html_url"]
-                  color = 0x5865F2 if action == "opened" else 0x57F287
+                  pr_title = pr["title"]
+                  pr_number = pr["number"]
+                  pr_url = pr["html_url"]
+                  pr_body = pr.get("body") or ""
+                  if len(pr_body) > 500:
+                      pr_body = pr_body[:497] + "..."
+
+                  color = 0x5865F2 if action in ["opened", "reopened"] else 0x57F287
                   embed = {
                       "author": {"name": actor_name, "icon_url": avatar_url},
-                      "title": f"Pull Request {action}: {title} (#{number})",
-                      "url": url,
+                      "title": f"[{repo_name}] Pull Request {action}: #{pr_number} {pr_title}",
+                      "url": pr_url,
+                      "description": pr_body,
                       "color": color,
                       "footer": {"text": repo_name},
                       "timestamp": event["created_at"]
@@ -277,14 +300,11 @@ jobs:
 
               if not success:
                   print(f"Failed to send embed for event {event_id}. Stopping sending.", file=sys.stderr)
-                  # Still save the last successfully sent ID (latest_sent_id) so next run continues from there
                   break
 
-              # Successfully sent – update the variable right away so we can resume
               latest_sent_id = event_id
               update_variable(latest_sent_id)
 
-              # Wait 4 minutes before next message (unless it's the last one)
               if i < len(embeds_to_send) - 1:
                   print("Waiting 4 minutes before next message...")
                   time.sleep(240)
