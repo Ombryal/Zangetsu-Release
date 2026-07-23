@@ -89,9 +89,10 @@ jobs:
             fi
           done
 
-      - name: Process new events and send to Discord
+      - name: Process new events and send to Discord (rotating webhooks)
         env:
-          WEBHOOK: ${{ secrets.DISCORD_EVENTS_WEBHOOK_URL }}
+          WEBHOOK_1: ${{ secrets.DISCORD_EVENTS_WEBHOOK_URL_1 }}
+          WEBHOOK_2: ${{ secrets.DISCORD_EVENTS_WEBHOOK_URL_2 }}
           LAST_ID: ${{ steps.last_event.outputs.id }}
         run: |
           set -euo pipefail
@@ -106,6 +107,17 @@ jobs:
 
           last_id = int(os.environ["LAST_ID"])
           new_last_id = last_id
+
+          # Build list of available webhook URLs
+          webhooks = []
+          for key in ("WEBHOOK_1", "WEBHOOK_2"):
+              url = os.environ.get(key, "").strip()
+              if url:
+                  webhooks.append(url)
+
+          if not webhooks:
+              print("No webhook URLs configured. Exiting.")
+              sys.exit(0)
 
           sorted_events = sorted(events, key=lambda e: int(e["id"]))
           embeds_to_send = []
@@ -151,7 +163,7 @@ jobs:
                       "footer": {"text": repo_name},
                       "timestamp": event["created_at"]
                   }
-                  embeds_to_send.append((embed, event_id))
+                  embeds_to_send.append(embed)
 
               elif event["type"] == "ForkEvent":
                   forkee = payload["forkee"]["full_name"]
@@ -163,7 +175,7 @@ jobs:
                       "footer": {"text": repo_name},
                       "timestamp": event["created_at"]
                   }
-                  embeds_to_send.append((embed, event_id))
+                  embeds_to_send.append(embed)
 
               elif event["type"] == "WatchEvent":
                   embed = {
@@ -174,7 +186,7 @@ jobs:
                       "footer": {"text": repo_name},
                       "timestamp": event["created_at"]
                   }
-                  embeds_to_send.append((embed, event_id))
+                  embeds_to_send.append(embed)
 
               elif event["type"] == "IssuesEvent":
                   issue = payload["issue"]
@@ -191,7 +203,7 @@ jobs:
                       "footer": {"text": repo_name},
                       "timestamp": event["created_at"]
                   }
-                  embeds_to_send.append((embed, event_id))
+                  embeds_to_send.append(embed)
 
               elif event["type"] == "IssueCommentEvent":
                   issue = payload["issue"]
@@ -210,7 +222,7 @@ jobs:
                       "footer": {"text": repo_name},
                       "timestamp": event["created_at"]
                   }
-                  embeds_to_send.append((embed, event_id))
+                  embeds_to_send.append(embed)
 
               elif event["type"] == "PullRequestEvent":
                   pr = payload["pull_request"]
@@ -227,21 +239,24 @@ jobs:
                       "footer": {"text": repo_name},
                       "timestamp": event["created_at"]
                   }
-                  embeds_to_send.append((embed, event_id))
+                  embeds_to_send.append(embed)
 
           sent_count = 0
-          for i, (embed, _) in enumerate(embeds_to_send):
+          for i, embed in enumerate(embeds_to_send):
+              # Rotate webhooks: use index modulo number of webhooks
+              webhook_url = webhooks[i % len(webhooks)]
+
               payload_json = {
                   "allowed_mentions": {"parse": []},
                   "embeds": [embed]
               }
-              attempt = 0
+
               success = False
-              while attempt < 3:
+              for attempt in range(3):
                   result = subprocess.run(
                       ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
                        "-H", "Content-Type: application/json",
-                       "-X", "POST", "--data", json.dumps(payload_json), os.environ["WEBHOOK"]],
+                       "-X", "POST", "--data", json.dumps(payload_json), webhook_url],
                       capture_output=True, text=True
                   )
                   if result.returncode == 0 and result.stdout.startswith("2"):
@@ -250,23 +265,21 @@ jobs:
                       break
                   else:
                       http_code = result.stdout.strip()
-                      print(f"HTTP {http_code} on attempt {attempt+1}")
-                      attempt += 1
-                      if attempt < 3:
-                          time.sleep(5)
+                      print(f"Webhook {webhook_url[-20:]} HTTP {http_code} on attempt {attempt+1}")
+                      time.sleep(5)
+
               if not success:
-                  print(f"Failed to send embed after 3 attempts. Last HTTP status: {http_code}", file=sys.stderr)
-                  # Do not exit; save what we have so far and let the next run continue
+                  print(f"Failed to send embed after 3 attempts to {webhook_url[-20:]}. Stopping sending.", file=sys.stderr)
                   break
 
-              # Wait 4 minutes (240 seconds) before sending the next message, unless it's the last one
+              # Wait 4 minutes between messages (unless it's the last one)
               if i < len(embeds_to_send) - 1:
                   print("Waiting 4 minutes before next message...")
                   time.sleep(240)
 
           print(f"Sent {sent_count} message(s) for new events.")
 
-          # Save the highest event ID that we successfully sent (or attempted)
+          # Save the highest event ID processed
           with open("new_last_id.txt", "w") as f:
               f.write(str(new_last_id))
           PY
