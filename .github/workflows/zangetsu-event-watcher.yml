@@ -41,12 +41,55 @@ jobs:
           fi
           echo "id=$LAST_ID" >> "$GITHUB_OUTPUT"
 
-      - name: Fetch recent repository events
+      - name: Fetch all new repository events (paginated)
         env:
           GH_TOKEN: ${{ github.token }}
+          LAST_ID: ${{ steps.last_event.outputs.id }}
         run: |
           set -euo pipefail
-          gh api "repos/$OWNER/$REPO/events?per_page=10" > events.json
+
+          LAST_ID="$LAST_ID"
+          PAGE=1
+          STOP=0
+          echo "[]" > new_events.json
+
+          while [ $STOP -eq 0 ]; do
+            echo "Fetching page $PAGE..."
+            gh api "repos/$OWNER/$REPO/events?per_page=100&page=$PAGE" > page.json
+
+            # Check if page is empty (no events)
+            EVENTS_COUNT="$(jq '. | length' page.json)"
+            if [ "$EVENTS_COUNT" -eq 0 ]; then
+              echo "No more events. Stopping."
+              break
+            fi
+
+            # Concatenate events into new_events.json
+            jq -s '.[0] + .[1]' new_events.json page.json > merged.json
+            mv merged.json new_events.json
+
+            # Get the smallest event ID on this page
+            MIN_ID="$(jq 'min_by(.id) | .id' page.json)"
+
+            # If any event on this page has an ID <= LAST_ID, we've reached already processed events
+            if [ "$MIN_ID" != "null" ]; then
+              if [ "$MIN_ID" -le "$LAST_ID" ]; then
+                echo "Reached events older than last processed ID ($LAST_ID). Stopping."
+                STOP=1
+              fi
+            else
+              # No events? shouldn't happen because we checked count, but just in case
+              echo "No valid IDs on this page."
+              break
+            fi
+
+            PAGE=$((PAGE + 1))
+            # Safety: stop after 10 pages to avoid infinite loop
+            if [ $PAGE -gt 10 ]; then
+              echo "Reached maximum pages (10). Stopping."
+              break
+            fi
+          done
 
       - name: Process new events and send to Discord
         env:
@@ -58,7 +101,7 @@ jobs:
           python3 - <<'PY'
           import json, os, subprocess, sys, time
 
-          with open("events.json", "r", encoding="utf-8") as f:
+          with open("new_events.json", "r", encoding="utf-8") as f:
               events = json.load(f)
 
           EVENT_TYPES = {"PushEvent", "ForkEvent", "WatchEvent", "IssuesEvent", "IssueCommentEvent", "PullRequestEvent"}
@@ -66,6 +109,7 @@ jobs:
           last_id = int(os.environ["LAST_ID"])
           new_last_id = last_id
 
+          # Sort events by ID (ascending) to process in order
           sorted_events = sorted(events, key=lambda e: int(e["id"]))
           embeds_to_send = []
 
