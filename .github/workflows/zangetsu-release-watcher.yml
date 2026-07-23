@@ -1,0 +1,282 @@
+name: Zangetsu Release Watcher
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/10 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zangetsu-release-watcher
+  cancel-in-progress: true
+
+env:
+  OWNER: Spyou
+  REPO: Zangetsu
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Fetch latest release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api repos/$OWNER/$REPO/releases/latest > release.json
+
+          TAG="$(jq -r '.tag_name' release.json)"
+          NAME="$(jq -r '.name // .tag_name' release.json)"
+          URL="$(jq -r '.html_url' release.json)"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Read last announced tag (from repository variable)
+        id: previous
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Fetch the variable; if not found, default to empty
+          if PREV="$(gh api "repos/${{ github.repository }}/actions/variables/LAST_ZANGETSU_TAG" --jq '.value' 2>/dev/null)"; then
+            echo "Last announced tag: '$PREV'"
+            echo "tag=$PREV" >> "$GITHUB_OUTPUT"
+          else
+            echo "No variable found. This is a fresh start."
+            echo "tag=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stop if already announced
+        if: steps.release.outputs.tag == steps.previous.outputs.tag
+        run: |
+          echo "Already announced (${{ steps.release.outputs.tag }})."
+          exit 0
+
+      - name: Refine release notes with Groq
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          RAW_BODY="$(jq -r '.body // ""' release.json)"
+          if [ -z "$RAW_BODY" ]; then
+            echo "No release notes to refine."
+            touch refined_body.txt
+            exit 0
+          fi
+
+          CLEAN_BODY="$(echo "$RAW_BODY" | grep -v "Don't know which version to download?" || true)"
+          if [ -z "$CLEAN_BODY" ]; then
+            echo "Release notes empty after cleaning."
+            touch refined_body.txt
+            exit 0
+          fi
+
+          PROMPT="You are a release notes categoriser. Your ONLY task is to reorganise the original changelog items into three sections. Do NOT rewrite, rephrase, or create new wording. Use the exact same bullet points as provided, just place them under the correct heading.
+
+          Use these Markdown level-2 headings:
+          ## ✨ Features
+          ## 🔧 Improvements
+          ## 🐛 Fixes
+
+          Rules:
+          - Categorise each bullet point from the original notes into Features (new capabilities), Improvements (enhancements to existing things), or Fixes (bug resolutions).
+          - If the original notes contain a line like \"Plus fixes:\" or similar, extract those items and place them directly under ## 🐛 Fixes without changing their text.
+          - Keep every original bullet point exactly as it appears — do not change words, remove emojis, or condense.
+          - If a section would have zero items, OMIT the entire section (both the heading and any placeholder text like 'None').
+          - Output ONLY the reorganised notes. No introductory or concluding text.
+
+          Original notes:
+          ${CLEAN_BODY}"
+
+          ESCAPED_PROMPT="$(echo "$PROMPT" | jq -Rs .)"
+
+          HTTP_CODE="$(curl -s -o /tmp/groq_response.json -w "%{http_code}" \
+            "https://api.groq.com/openai/v1/chat/completions" \
+            -H "Authorization: Bearer ${GROQ_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"model\": \"llama-3.1-8b-instant\",
+              \"messages\": [{\"role\": \"user\", \"content\": ${ESCAPED_PROMPT}}],
+              \"temperature\": 0.3
+            }")"
+
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "Groq API returned HTTP $HTTP_CODE, falling back to raw notes."
+            printf '%s' "$CLEAN_BODY" > refined_body.txt
+            exit 0
+          fi
+
+          REFINED="$(jq -r '.choices[0].message.content // empty' /tmp/groq_response.json)"
+          if [ -z "$REFINED" ]; then
+            echo "Could not parse Groq response, falling back to raw notes."
+            printf '%s' "$CLEAN_BODY" > refined_body.txt
+          else
+            printf '%s' "$REFINED" > refined_body.txt
+            echo "Successfully refined notes with Groq."
+          fi
+
+      - name: Build Discord payloads
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json, os
+
+          with open("release.json", "r", encoding="utf-8") as f:
+              release = json.load(f)
+
+          tag = release.get("tag_name", "")
+          name = release.get("name") or tag
+          url = release.get("html_url", "")
+          prerelease = bool(release.get("prerelease")) or "beta" in tag.lower()
+
+          body = ""
+          if os.path.exists("refined_body.txt"):
+              with open("refined_body.txt", "r", encoding="utf-8") as f:
+                  body = f.read().strip()
+          if not body:
+              body = release.get("body") or ""
+              cleaned = []
+              for line in body.splitlines():
+                  if "Don't know which version to download?" in line:
+                      continue
+                  cleaned.append(line)
+              body = "\n".join(cleaned).strip()
+
+          description_parts = []
+          if prerelease:
+              description_parts.append(
+                  "⚠️ **BETA WARNING**\n"
+                  "This is a Beta Release. Features and fixes in this version are still under testing and may contain bugs or unexpected behavior. "
+                  "Please report any issues you encounter. Do not use in production."
+              )
+          if body:
+              description_parts.append(body)
+          description = "\n\n".join(description_parts).strip()
+          if not description:
+              description = " "
+
+          max_bytes = 3900
+          if len(description.encode("utf-8")) > max_bytes:
+              desc_bytes = description.encode("utf-8")[:max_bytes-3]
+              description = desc_bytes.decode("utf-8", "ignore").rstrip() + "..."
+
+          role_id = os.environ.get("DISCORD_ROLE_ID", "").strip()
+          content = f"<@&{role_id}>" if role_id else ""
+
+          embed_payload = {
+              "allowed_mentions": {"parse": []},
+              "content": content,
+              "embeds": [{
+                  "title": f"New Release: {name}",
+                  "url": url,
+                  "description": description,
+                  "color": 5814783,
+                  "footer": {
+                      "text": f"Version {tag}"
+                  }
+              }]
+          }
+
+          with open("payload_embed.json", "w", encoding="utf-8") as f:
+              json.dump(embed_payload, f, ensure_ascii=False)
+
+          def apk_label(asset_name: str) -> str | None:
+              n = asset_name.lower()
+              if not n.endswith(".apk"):
+                  return None
+              if "arm64-v8a" in n:
+                  return "APK (arm64)"
+              if "armeabi-v7a" in n:
+                  return "APK (armeabi-v7a)"
+              if "tv" in n:
+                  return "APK (TV)"
+              if "universal" in n:
+                  return "APK (universal)"
+              return None
+
+          assets = release.get("assets", [])
+          apk_lines = []
+          for asset in assets:
+              asset_name = asset.get("name", "download")
+              label = apk_label(asset_name)
+              if not label:
+                  continue
+              size_mb = asset.get("size", 0) / (1024 * 1024)
+              asset_url = asset.get("browser_download_url", "")
+              apk_lines.append(
+                  f"🔹 [Download | {size_mb:.2f} MB | {label}]({asset_url})"
+              )
+
+          if apk_lines:
+              apk_content = "**APK Downloads**\n" + "\n".join(apk_lines)
+              apk_payload = {
+                  "allowed_mentions": {"parse": []},
+                  "content": apk_content,
+                  "embeds": []
+              }
+              with open("payload_apk.json", "w", encoding="utf-8") as f:
+                  json.dump(apk_payload, f, ensure_ascii=False)
+          PY
+        env:
+          DISCORD_ROLE_ID: ${{ secrets.DISCORD_ROLE_ID }}
+
+      - name: Send Discord messages
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          set -euo pipefail
+
+          send_payload() {
+            local payload_file="$1"
+            local description="$2"
+
+            http_code="$(curl -sS \
+              -o /tmp/discord_response.txt \
+              -w "%{http_code}" \
+              -H "Content-Type: application/json" \
+              -A "Zangetsu-Release-Watcher/1.0" \
+              -X POST \
+              --data "@${payload_file}" \
+              "$WEBHOOK")"
+
+            echo "${description} HTTP status: $http_code"
+            cat /tmp/discord_response.txt || true
+
+            if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+              echo "::error::${description} failed with HTTP $http_code"
+              exit 1
+            fi
+          }
+
+          send_payload "payload_embed.json" "Embed message"
+
+          if [ -f "payload_apk.json" ]; then
+            send_payload "payload_apk.json" "APK message"
+          fi
+
+      - name: Update last announced tag (repository variable)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.release.outputs.tag }}"
+
+          # Update the variable (PATCH) or create it if missing (POST)
+          if gh api --method PATCH "repos/${{ github.repository }}/actions/variables/LAST_ZANGETSU_TAG" \
+               -f name="LAST_ZANGETSU_TAG" \
+               -f value="$TAG" 2>/dev/null; then
+            echo "Variable updated to $TAG"
+          else
+            gh api --method POST "repos/${{ github.repository }}/actions/variables" \
+               -f name="LAST_ZANGETSU_TAG" \
+               -f value="$TAG"
+            echo "Variable created with $TAG"
+          fi
