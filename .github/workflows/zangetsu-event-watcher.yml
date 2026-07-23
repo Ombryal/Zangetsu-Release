@@ -1,0 +1,221 @@
+name: Zangetsu Event Watcher
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: zangetsu-event-watcher
+  cancel-in-progress: true
+
+env:
+  OWNER: Spyou
+  REPO: Zangetsu
+  STATE_FILE: .state/last_event_id.txt
+
+jobs:
+  watch-events:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read last processed event ID
+        id: last_event
+        run: |
+          set -euo pipefail
+          if [ -f "$STATE_FILE" ]; then
+            echo "id=$(tr -d '\r\n' < "$STATE_FILE")" >> "$GITHUB_OUTPUT"
+          else
+            echo "id=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch recent repository events
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$OWNER/$REPO/events?per_page=10" > events.json
+
+      - name: Process new events and send to Discord
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_EVENTS_WEBHOOK_URL }}
+          LAST_ID: ${{ steps.last_event.outputs.id }}
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json, os, subprocess, sys
+
+          with open("events.json", "r", encoding="utf-8") as f:
+              events = json.load(f)
+
+          EVENT_TYPES = {"PushEvent", "ForkEvent", "WatchEvent", "IssuesEvent", "IssueCommentEvent", "PullRequestEvent"}
+
+          last_id = os.environ["LAST_ID"]
+          new_last_id = last_id
+          embeds = []
+
+          for event in sorted(events, key=lambda e: e["id"]):
+              if event["id"] <= last_id:
+                  continue
+              if event["type"] not in EVENT_TYPES:
+                  continue
+
+              new_last_id = max(new_last_id, event["id"])
+              actor = event["actor"]
+              avatar_url = actor["avatar_url"] + "&s=80"
+              actor_name = actor["display_login"]
+              payload = event.get("payload", {})
+              repo_name = event["repo"]["name"]
+
+              # ---- PushEvent (commits) - one embed per push ----
+              if event["type"] == "PushEvent":
+                  ref = payload.get("ref", "").replace("refs/heads/", "")
+                  commits = payload.get("commits", [])
+                  if not commits:
+                      continue
+
+                  commit_lines = []
+                  for c in commits:
+                      sha = c["sha"][:7]
+                      msg = c["message"].split("\n")[0]
+                      author = c["author"]["name"]
+                      commit_lines.append(f"`{sha}` {msg} — **{author}**")
+
+                  commit_count = len(commits)
+                  title = f"📦 [{ref}] {commit_count} new commit{'s' if commit_count > 1 else ''}"
+
+                  embed = {
+                      "author": {
+                          "name": actor_name,
+                          "icon_url": avatar_url
+                      },
+                      "title": title,
+                      "description": "\n".join(commit_lines),
+                      "color": 0x57A9FF,
+                      "footer": {"text": repo_name},
+                      "timestamp": event["created_at"]
+                  }
+                  embeds.append(embed)
+
+              # ---- ForkEvent ----
+              elif event["type"] == "ForkEvent":
+                  forkee = payload["forkee"]["full_name"]
+                  embed = {
+                      "author": {"name": actor_name, "icon_url": avatar_url},
+                      "title": "🍴 New Fork",
+                      "description": f"**{forkee}**",
+                      "color": 0xFFAC33,
+                      "footer": {"text": repo_name},
+                      "timestamp": event["created_at"]
+                  }
+                  embeds.append(embed)
+
+              # ---- WatchEvent (star) ----
+              elif event["type"] == "WatchEvent":
+                  embed = {
+                      "author": {"name": actor_name, "icon_url": avatar_url},
+                      "title": "⭐ New Star",
+                      "description": f"{actor_name} starred the repository",
+                      "color": 0xFFD700,
+                      "footer": {"text": repo_name},
+                      "timestamp": event["created_at"]
+                  }
+                  embeds.append(embed)
+
+              # ---- IssuesEvent ----
+              elif event["type"] == "IssuesEvent":
+                  issue = payload["issue"]
+                  action = payload["action"]
+                  title = issue["title"]
+                  number = issue["number"]
+                  url = issue["html_url"]
+                  color = 0xED4245 if action in ["opened", "reopened"] else 0x57F287
+                  embed = {
+                      "author": {"name": actor_name, "icon_url": avatar_url},
+                      "title": f"Issue {action}: {title} (#{number})",
+                      "url": url,
+                      "color": color,
+                      "footer": {"text": repo_name},
+                      "timestamp": event["created_at"]
+                  }
+                  embeds.append(embed)
+
+              # ---- IssueCommentEvent ----
+              elif event["type"] == "IssueCommentEvent":
+                  issue = payload["issue"]
+                  comment = payload["comment"]
+                  issue_title = issue["title"]
+                  issue_number = issue["number"]
+                  comment_body = comment["body"]
+                  if len(comment_body) > 500:
+                      comment_body = comment_body[:497] + "..."
+                  embed = {
+                      "author": {"name": actor_name, "icon_url": avatar_url},
+                      "title": f"💬 Comment on #{issue_number}: {issue_title}",
+                      "description": comment_body,
+                      "url": comment["html_url"],
+                      "color": 0x5865F2,
+                      "footer": {"text": repo_name},
+                      "timestamp": event["created_at"]
+                  }
+                  embeds.append(embed)
+
+              # ---- PullRequestEvent ----
+              elif event["type"] == "PullRequestEvent":
+                  pr = payload["pull_request"]
+                  action = payload["action"]
+                  title = pr["title"]
+                  number = pr["number"]
+                  url = pr["html_url"]
+                  color = 0x5865F2 if action == "opened" else 0x57F287
+                  embed = {
+                      "author": {"name": actor_name, "icon_url": avatar_url},
+                      "title": f"Pull Request {action}: {title} (#{number})",
+                      "url": url,
+                      "color": color,
+                      "footer": {"text": repo_name},
+                      "timestamp": event["created_at"]
+                  }
+                  embeds.append(embed)
+
+          # Send all embeds in one message
+          if embeds:
+              payload_json = {
+                  "allowed_mentions": {"parse": []},
+                  "embeds": embeds
+              }
+              result = subprocess.run(
+                  ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
+                   "-H", "Content-Type: application/json",
+                   "-X", "POST", "--data", json.dumps(payload_json), os.environ["WEBHOOK"]],
+                  capture_output=True, text=True
+              )
+              if result.returncode != 0 or not result.stdout.startswith("2"):
+                  print(f"Failed to send webhook: HTTP {result.stdout.strip()}", file=sys.stderr)
+                  sys.exit(1)
+              print(f"Sent {len(embeds)} embed(s) for new events.")
+
+          # Save latest event ID
+          with open("new_last_id.txt", "w") as f:
+              f.write(new_last_id)
+          PY
+
+      - name: Save latest event ID
+        run: |
+          set -euo pipefail
+          mkdir -p .state
+          cp new_last_id.txt "$STATE_FILE"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$STATE_FILE"
+          git commit -m "Update last event ID" || exit 0
+          git push
