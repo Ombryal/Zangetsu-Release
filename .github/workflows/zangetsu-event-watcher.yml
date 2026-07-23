@@ -33,6 +33,9 @@ jobs:
           set -euo pipefail
           if [ -f "$STATE_FILE" ]; then
             LAST_ID="$(tr -d '\r\n' < "$STATE_FILE")"
+            if [ -z "$LAST_ID" ]; then
+              LAST_ID="0"
+            fi
           else
             LAST_ID="0"
           fi
@@ -63,9 +66,8 @@ jobs:
           last_id = int(os.environ["LAST_ID"])
           new_last_id = last_id
 
-          # Sort events by ID (as integers) to process in order
           sorted_events = sorted(events, key=lambda e: int(e["id"]))
-          embeds_to_send = []  # list of (embed, event_id)
+          embeds_to_send = []
 
           for event in sorted_events:
               event_id = int(event["id"])
@@ -186,7 +188,6 @@ jobs:
                   }
                   embeds_to_send.append((embed, event_id))
 
-          # ---- Send each embed as a separate message with a short delay ----
           sent_count = 0
           for embed, _ in embeds_to_send:
               payload_json = {
@@ -213,13 +214,11 @@ jobs:
                           print(f"Failed to send embed after 3 attempts: HTTP {result.stdout.strip()}", file=sys.stderr)
                           sys.exit(1)
 
-              # Wait 2 seconds between messages to respect Discord rate limits
               if embed != embeds_to_send[-1][0]:
                   time.sleep(2)
 
           print(f"Sent {sent_count} message(s) for new events.")
 
-          # Save the new highest event ID (as string)
           with open("new_last_id.txt", "w") as f:
               f.write(str(new_last_id))
           PY
