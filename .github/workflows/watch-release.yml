@@ -80,10 +80,10 @@ jobs:
             exit 0
           fi
 
-          PROMPT="You are a release notes formatter. Reformat the following release notes into exactly three short sections. Use these section titles exactly as shown (capitalised, with emojis, no extra characters):
-          ✨ Features
-          🔧 Improvements
-          🐛 Fixes
+          PROMPT="You are a release notes formatter. Reformat the following release notes into exactly three short sections. Use these section titles exactly as shown but make them bold with double asterisks (e.g. **✨ Features**):
+          **✨ Features**
+          **🔧 Improvements**
+          **🐛 Fixes**
           Rules:
           - Do NOT add any horizontal lines, dashes, asterisks, or separator characters between sections.
           - Write each section as a plain bullet list (using - or •).
