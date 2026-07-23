@@ -75,15 +75,6 @@ jobs:
             fi
           done
 
-      - name: Debug – show fetched event summary
-        run: |
-          echo "Total events fetched: $(jq '. | length' new_events.json)"
-          echo "Event types found:"
-          jq -r 'group_by(.type)[] | "\(.[0].type): \(length)"' new_events.json
-          echo "Event IDs range:"
-          echo "Min: $(jq -r 'min_by(.id).id' new_events.json)"
-          echo "Max: $(jq -r 'max_by(.id).id' new_events.json)"
-
       - name: Process new events and send to Discord (resumable)
         env:
           WEBHOOK_1: ${{ secrets.DISCORD_EVENTS_WEBHOOK_URL_1 }}
@@ -154,7 +145,6 @@ jobs:
               repo_name = event["repo"]["name"]
               repo_url = f"https://github.com/{repo_name}"
 
-              # PushEvent
               if event["type"] == "PushEvent":
                   ref = payload.get("ref", "").replace("refs/heads/", "")
                   commits = payload.get("commits", [])
@@ -168,18 +158,15 @@ jobs:
                   embed = {"author":{"name":actor_name,"icon_url":avatar_url},"title":title,"url":branch_url,"description":"\n".join(commit_lines),"color":0x57A9FF,"footer":{"text":repo_name},"timestamp":event["created_at"]}
                   embeds_to_send.append((embed, event_id))
 
-              # ForkEvent
               elif event["type"] == "ForkEvent":
                   forkee = payload["forkee"]["full_name"]
                   embed = {"author":{"name":actor_name,"icon_url":avatar_url},"title":f"[{repo_name}] Fork created: {forkee}","url":f"https://github.com/{forkee}","color":0xFFAC33,"footer":{"text":repo_name},"timestamp":event["created_at"]}
                   embeds_to_send.append((embed, event_id))
 
-              # WatchEvent (star)
               elif event["type"] == "WatchEvent":
                   embed = {"author":{"name":actor_name,"icon_url":avatar_url},"title":f"[{repo_name}] New star added","url":repo_url,"color":0xFFD700,"footer":{"text":repo_name},"timestamp":event["created_at"]}
                   embeds_to_send.append((embed, event_id))
 
-              # IssuesEvent
               elif event["type"] == "IssuesEvent":
                   issue = payload["issue"]
                   action = payload["action"]
@@ -188,7 +175,6 @@ jobs:
                   embed = {"author":{"name":actor_name,"icon_url":avatar_url},"title":f"[{repo_name}] Issue {action}: #{issue['number']} {issue['title']}","url":issue["html_url"],"description":body,"color":color,"footer":{"text":repo_name},"timestamp":event["created_at"]}
                   embeds_to_send.append((embed, event_id))
 
-              # IssueCommentEvent
               elif event["type"] == "IssueCommentEvent":
                   issue = payload["issue"]
                   comment = payload["comment"]
@@ -196,7 +182,6 @@ jobs:
                   embed = {"author":{"name":actor_name,"icon_url":avatar_url},"title":f"[{repo_name}] New comment on issue #{issue['number']}: {issue['title']}","url":comment["html_url"],"description":body,"color":0x5865F2,"footer":{"text":repo_name},"timestamp":event["created_at"]}
                   embeds_to_send.append((embed, event_id))
 
-              # PullRequestEvent
               elif event["type"] == "PullRequestEvent":
                   pr = payload["pull_request"]
                   action = payload["action"]
