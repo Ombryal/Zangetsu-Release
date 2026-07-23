@@ -80,12 +80,12 @@ jobs:
             exit 0
           fi
 
-          PROMPT="You are a release notes formatter. Reformat the following release notes into exactly three short sections. Use these section titles exactly as shown but make them bold with double asterisks (e.g. **✨ Features**):
+          PROMPT="You are a release notes formatter. Reformat the following release notes into exactly three short sections. Use these exact bold headings (with double asterisks):
           **✨ Features**
           **🔧 Improvements**
           **🐛 Fixes**
           Rules:
-          - Do NOT add any horizontal lines, dashes, asterisks, or separator characters between sections.
+          - Do NOT add any horizontal lines, dashes, or separator characters.
           - Write each section as a plain bullet list (using - or •).
           - If a section has no items, omit it entirely.
           - Output only the reformatted notes. No introductory or concluding text.
@@ -119,13 +119,13 @@ jobs:
             echo "Successfully refined notes with Groq."
           fi
 
-      # ------------------------- BUILD PAYLOADS -------------------------
+      # ------------------------- BUILD DISCORD PAYLOADS -------------------------
       - name: Build Discord payloads
         run: |
           set -euo pipefail
 
           python3 - <<'PY'
-          import json
+          import json, os
 
           with open("release.json", "r", encoding="utf-8") as f:
               release = json.load(f)
@@ -135,13 +135,11 @@ jobs:
           url = release.get("html_url", "")
           prerelease = bool(release.get("prerelease")) or "beta" in tag.lower()
 
+          # Use refined body if available, otherwise raw
           body = ""
-          try:
+          if os.path.exists("refined_body.txt"):
               with open("refined_body.txt", "r", encoding="utf-8") as f:
                   body = f.read().strip()
-          except FileNotFoundError:
-              body = ""
-
           if not body:
               body = release.get("body") or ""
               cleaned = []
@@ -151,6 +149,49 @@ jobs:
                   cleaned.append(line)
               body = "\n".join(cleaned).strip()
 
+          # ---- Build description with beta warning if needed ----
+          description_parts = []
+          if prerelease:
+              description_parts.append(
+                  "⚠️ **BETA WARNING**\n"
+                  "This is a Beta Release. Features and fixes in this version are still under testing and may contain bugs or unexpected behavior. "
+                  "Please report any issues you encounter. Do not use in production."
+              )
+          if body:
+              description_parts.append(body)
+          description = "\n\n".join(description_parts).strip()
+          if not description:
+              description = " "
+
+          # Truncate to 3900 bytes safe
+          max_bytes = 3900
+          if len(description.encode("utf-8")) > max_bytes:
+              desc_bytes = description.encode("utf-8")[:max_bytes-3]
+              description = desc_bytes.decode("utf-8", "ignore").rstrip() + "..."
+
+          # ---- Role ping (optional) ----
+          role_id = os.environ.get("DISCORD_ROLE_ID", "").strip()
+          content = f"<@&{role_id}>" if role_id else ""
+
+          # ---- Embed payload (single embed) ----
+          embed_payload = {
+              "allowed_mentions": {"parse": []},
+              "content": content,
+              "embeds": [{
+                  "title": f"New Release: {name}",
+                  "url": url,
+                  "description": description,
+                  "color": 5814783,
+                  "footer": {
+                      "text": f"Version {tag}"
+                  }
+              }]
+          }
+
+          with open("payload_embed.json", "w", encoding="utf-8") as f:
+              json.dump(embed_payload, f, ensure_ascii=False)
+
+          # ---- APK assets ----
           def apk_label(asset_name: str) -> str | None:
               n = asset_name.lower()
               if not n.endswith(".apk"):
@@ -167,65 +208,29 @@ jobs:
 
           assets = release.get("assets", [])
           apk_lines = []
-
           for asset in assets:
               asset_name = asset.get("name", "download")
               label = apk_label(asset_name)
               if not label:
                   continue
-
               size_mb = asset.get("size", 0) / (1024 * 1024)
               asset_url = asset.get("browser_download_url", "")
               apk_lines.append(
                   f"🔹 [Download | {size_mb:.2f} MB | {label}]({asset_url})"
               )
 
-          description_parts = []
-          if prerelease:
-              description_parts.append(
-                  "⚠️ **BETA WARNING**\n"
-                  "This is a Beta Release. Features and fixes in this version are still under testing and may contain bugs or unexpected behavior. "
-                  "Please report any issues you encounter. Do not use in production."
-              )
-          if body:
-              description_parts.append(body)
-
-          description = "\n\n".join(description_parts).strip()
-          if not description:
-              description = " "
-
-          max_bytes = 3900
-          if len(description.encode("utf-8")) > max_bytes:
-              desc_bytes = description.encode("utf-8")[:max_bytes-3]
-              description = desc_bytes.decode("utf-8", "ignore").rstrip() + "..."
-
-          embed_payload = {
-              "allowed_mentions": {"parse": []},
-              "content": "",
-              "embeds": [{
-                  "title": f"New Release: {name}",
-                  "url": url,
-                  "description": description,
-                  "color": 5814783,
-                  "footer": {
-                      "text": f"Version {tag}"
-                  }
-              }]
-          }
-
-          with open("payload_embed.json", "w", encoding="utf-8") as f:
-              json.dump(embed_payload, f, ensure_ascii=False)
-
           if apk_lines:
-              content = "**APK Downloads**\n" + "\n".join(apk_lines)
+              apk_content = "**APK Downloads**\n" + "\n".join(apk_lines)
               apk_payload = {
                   "allowed_mentions": {"parse": []},
-                  "content": content,
+                  "content": apk_content,
                   "embeds": []
               }
               with open("payload_apk.json", "w", encoding="utf-8") as f:
                   json.dump(apk_payload, f, ensure_ascii=False)
           PY
+        env:
+          DISCORD_ROLE_ID: ${{ secrets.DISCORD_ROLE_ID }}
 
       - name: Send Discord messages
         env:
@@ -255,8 +260,10 @@ jobs:
             fi
           }
 
+          # 1. Send the embed message (with optional role ping)
           send_payload "payload_embed.json" "Embed message"
 
+          # 2. Send the APK message if it exists
           if [ -f "payload_apk.json" ]; then
             send_payload "payload_apk.json" "APK message"
           fi
