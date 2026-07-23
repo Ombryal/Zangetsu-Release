@@ -145,28 +145,62 @@ jobs:
               repo_name = event["repo"]["name"]
               repo_url = f"https://github.com/{repo_name}"
 
+              # ---- PushEvent ----
               if event["type"] == "PushEvent":
                   ref = payload.get("ref", "").replace("refs/heads/", "")
                   commits = payload.get("commits", [])
-                  if not commits: continue
                   branch_url = f"{repo_url}/tree/{ref}"
-                  commit_lines = []
-                  for c in commits:
-                      fsha = c["sha"]
-                      commit_lines.append(f"[`{fsha[:7]}`]({repo_url}/commit/{fsha}) {c['message'].split(chr(10))[0]} — **{c['author']['name']}**")
-                  title = f"[{repo_name}:{ref}] {len(commits)} new commit{'s' if len(commits)>1 else ''}"
-                  embed = {"author":{"name":actor_name,"icon_url":avatar_url},"title":title,"url":branch_url,"description":"\n".join(commit_lines),"color":0x57A9FF,"footer":{"text":repo_name},"timestamp":event["created_at"]}
+
+                  if commits:
+                      commit_lines = []
+                      for c in commits:
+                          fsha = c["sha"]
+                          commit_lines.append(
+                              f"[`{fsha[:7]}`]({repo_url}/commit/{fsha}) {c['message'].split(chr(10))[0]} — **{c['author']['name']}**"
+                          )
+                      commit_count = len(commits)
+                      description = "\n".join(commit_lines)
+                  else:
+                      head = payload.get("head_commit")
+                      size = payload.get("size", 0)
+                      if head:
+                          fsha = head["sha"]
+                          description = (
+                              f"[`{fsha[:7]}`]({repo_url}/commit/{fsha}) "
+                              f"{head['message'].split(chr(10))[0]} — **{head['author']['name']}**"
+                          )
+                          commit_count = 1 if size == 0 else size
+                      elif size and size > 0:
+                          description = f"{size} commit{'s' if size > 1 else ''} (details not available)"
+                          commit_count = size
+                      else:
+                          description = "Push event (no commit details)"
+                          commit_count = 0
+
+                  title = f"[{repo_name}:{ref}] {commit_count} new commit{'s' if commit_count != 1 else ''}"
+                  embed = {
+                      "author": {"name": actor_name, "icon_url": avatar_url},
+                      "title": title,
+                      "url": branch_url,
+                      "description": description,
+                      "color": 0x57A9FF,
+                      "footer": {"text": repo_name},
+                      "timestamp": event["created_at"]
+                  }
                   embeds_to_send.append((embed, event_id))
 
+              # ---- ForkEvent ----
               elif event["type"] == "ForkEvent":
                   forkee = payload["forkee"]["full_name"]
                   embed = {"author":{"name":actor_name,"icon_url":avatar_url},"title":f"[{repo_name}] Fork created: {forkee}","url":f"https://github.com/{forkee}","color":0xFFAC33,"footer":{"text":repo_name},"timestamp":event["created_at"]}
                   embeds_to_send.append((embed, event_id))
 
+              # ---- WatchEvent ----
               elif event["type"] == "WatchEvent":
                   embed = {"author":{"name":actor_name,"icon_url":avatar_url},"title":f"[{repo_name}] New star added","url":repo_url,"color":0xFFD700,"footer":{"text":repo_name},"timestamp":event["created_at"]}
                   embeds_to_send.append((embed, event_id))
 
+              # ---- IssuesEvent ----
               elif event["type"] == "IssuesEvent":
                   issue = payload["issue"]
                   action = payload["action"]
@@ -175,6 +209,7 @@ jobs:
                   embed = {"author":{"name":actor_name,"icon_url":avatar_url},"title":f"[{repo_name}] Issue {action}: #{issue['number']} {issue['title']}","url":issue["html_url"],"description":body,"color":color,"footer":{"text":repo_name},"timestamp":event["created_at"]}
                   embeds_to_send.append((embed, event_id))
 
+              # ---- IssueCommentEvent ----
               elif event["type"] == "IssueCommentEvent":
                   issue = payload["issue"]
                   comment = payload["comment"]
@@ -182,6 +217,7 @@ jobs:
                   embed = {"author":{"name":actor_name,"icon_url":avatar_url},"title":f"[{repo_name}] New comment on issue #{issue['number']}: {issue['title']}","url":comment["html_url"],"description":body,"color":0x5865F2,"footer":{"text":repo_name},"timestamp":event["created_at"]}
                   embeds_to_send.append((embed, event_id))
 
+              # ---- PullRequestEvent ----
               elif event["type"] == "PullRequestEvent":
                   pr = payload["pull_request"]
                   action = payload["action"]
