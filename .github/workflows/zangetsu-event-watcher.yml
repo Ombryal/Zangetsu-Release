@@ -43,10 +43,9 @@ jobs:
           set -euo pipefail
           LAST_ID="$LAST_ID"
           PAGE=1
-          STOP=0
           echo "[]" > new_events.json
 
-          while [ $STOP -eq 0 ]; do
+          while true; do
             echo "Fetching page $PAGE..."
             set +e
             gh api "repos/$OWNER/$REPO/events?per_page=100&page=$PAGE" > page.json
@@ -56,22 +55,28 @@ jobs:
               echo "GitHub API error. Stopping."
               break
             fi
+
             EVENTS_COUNT="$(jq '. | length' page.json)"
             if [ "$EVENTS_COUNT" -eq 0 ]; then
               echo "No more events."
               break
             fi
+
+            # Check the newest event on this page (first element)
+            NEWEST_ID="$(jq -r '.[0].id | tonumber' page.json)"
+            if [ "$NEWEST_ID" -le "$LAST_ID" ]; then
+              echo "All events on this page are already processed. Stopping."
+              break
+            fi
+
+            # Merge page into the total collection
             jq -s '.[0] + .[1]' new_events.json page.json > merged.json
             mv merged.json new_events.json
-            MIN_ID="$(jq -r '[.[].id | tonumber] | min' page.json)"
-            if [ "$MIN_ID" -le "$LAST_ID" ]; then
-              echo "Reached already processed events."
-              STOP=1
-            fi
+
             PAGE=$((PAGE + 1))
             if [ $PAGE -gt 10 ]; then
               echo "Max pages reached."
-              STOP=1
+              break
             fi
           done
 
@@ -105,6 +110,7 @@ jobs:
 
           def update_variable(new_id):
               repo = os.environ["GITHUB_REPOSITORY"]
+              # Try PATCH first
               patch = subprocess.run(
                   ["gh", "api", "--method", "PATCH",
                    f"repos/{repo}/actions/variables/LAST_ZANGETSU_EVENT_ID",
@@ -115,6 +121,7 @@ jobs:
               if patch.returncode == 0:
                   print(f"Updated variable to {new_id}")
                   return
+              # PATCH failed – create via POST
               print(f"PATCH failed, creating variable. Error: {patch.stderr.strip()}")
               post = subprocess.run(
                   ["gh", "api", "--method", "POST",
@@ -147,7 +154,6 @@ jobs:
 
               # ---- PushEvent ----
               if event["type"] == "PushEvent":
-                  # Skip branch / tag deletions
                   if payload.get("deleted"):
                       continue
 
@@ -168,7 +174,6 @@ jobs:
                   else:
                       head = payload.get("head_commit")
                       size = payload.get("size", 0)
-                      # Use head_commit if available, otherwise fall back to 'after' SHA
                       if head:
                           fsha = head["sha"]
                           description = (
@@ -183,8 +188,7 @@ jobs:
                           description = f"{size} commit{'s' if size > 1 else ''} (details not available)"
                           commit_count = size
                       else:
-                          # No commit info at all – skip
-                          continue
+                          continue  # no commit info → skip
 
                   title = f"[{repo_name}:{ref}] {commit_count} new commit{'s' if commit_count != 1 else ''}"
                   embed = {
@@ -201,12 +205,26 @@ jobs:
               # ---- ForkEvent ----
               elif event["type"] == "ForkEvent":
                   forkee = payload["forkee"]["full_name"]
-                  embed = {"author":{"name":actor_name,"icon_url":avatar_url},"title":f"[{repo_name}] Fork created: {forkee}","url":f"https://github.com/{forkee}","color":0xFFAC33,"footer":{"text":repo_name},"timestamp":event["created_at"]}
+                  embed = {
+                      "author": {"name": actor_name, "icon_url": avatar_url},
+                      "title": f"[{repo_name}] Fork created: {forkee}",
+                      "url": f"https://github.com/{forkee}",
+                      "color": 0xFFAC33,
+                      "footer": {"text": repo_name},
+                      "timestamp": event["created_at"]
+                  }
                   embeds_to_send.append((embed, event_id))
 
               # ---- WatchEvent ----
               elif event["type"] == "WatchEvent":
-                  embed = {"author":{"name":actor_name,"icon_url":avatar_url},"title":f"[{repo_name}] New star added","url":repo_url,"color":0xFFD700,"footer":{"text":repo_name},"timestamp":event["created_at"]}
+                  embed = {
+                      "author": {"name": actor_name, "icon_url": avatar_url},
+                      "title": f"[{repo_name}] New star added",
+                      "url": repo_url,
+                      "color": 0xFFD700,
+                      "footer": {"text": repo_name},
+                      "timestamp": event["created_at"]
+                  }
                   embeds_to_send.append((embed, event_id))
 
               # ---- IssuesEvent ----
@@ -214,8 +232,16 @@ jobs:
                   issue = payload["issue"]
                   action = payload["action"]
                   body = (issue.get("body") or "")[:500]
-                  color = 0xED4245 if action in ("opened","reopened") else 0x57F287
-                  embed = {"author":{"name":actor_name,"icon_url":avatar_url},"title":f"[{repo_name}] Issue {action}: #{issue['number']} {issue['title']}","url":issue["html_url"],"description":body,"color":color,"footer":{"text":repo_name},"timestamp":event["created_at"]}
+                  color = 0xED4245 if action in ("opened", "reopened") else 0x57F287
+                  embed = {
+                      "author": {"name": actor_name, "icon_url": avatar_url},
+                      "title": f"[{repo_name}] Issue {action}: #{issue['number']} {issue['title']}",
+                      "url": issue["html_url"],
+                      "description": body,
+                      "color": color,
+                      "footer": {"text": repo_name},
+                      "timestamp": event["created_at"]
+                  }
                   embeds_to_send.append((embed, event_id))
 
               # ---- IssueCommentEvent ----
@@ -223,7 +249,15 @@ jobs:
                   issue = payload["issue"]
                   comment = payload["comment"]
                   body = comment["body"][:500]
-                  embed = {"author":{"name":actor_name,"icon_url":avatar_url},"title":f"[{repo_name}] New comment on issue #{issue['number']}: {issue['title']}","url":comment["html_url"],"description":body,"color":0x5865F2,"footer":{"text":repo_name},"timestamp":event["created_at"]}
+                  embed = {
+                      "author": {"name": actor_name, "icon_url": avatar_url},
+                      "title": f"[{repo_name}] New comment on issue #{issue['number']}: {issue['title']}",
+                      "url": comment["html_url"],
+                      "description": body,
+                      "color": 0x5865F2,
+                      "footer": {"text": repo_name},
+                      "timestamp": event["created_at"]
+                  }
                   embeds_to_send.append((embed, event_id))
 
               # ---- PullRequestEvent ----
@@ -231,19 +265,34 @@ jobs:
                   pr = payload["pull_request"]
                   action = payload["action"]
                   body = (pr.get("body") or "")[:500]
-                  color = 0x5865F2 if action in ("opened","reopened") else 0x57F287
-                  embed = {"author":{"name":actor_name,"icon_url":avatar_url},"title":f"[{repo_name}] Pull Request {action}: #{pr['number']} {pr['title']}","url":pr["html_url"],"description":body,"color":color,"footer":{"text":repo_name},"timestamp":event["created_at"]}
+                  color = 0x5865F2 if action in ("opened", "reopened") else 0x57F287
+                  embed = {
+                      "author": {"name": actor_name, "icon_url": avatar_url},
+                      "title": f"[{repo_name}] Pull Request {action}: #{pr['number']} {pr['title']}",
+                      "url": pr["html_url"],
+                      "description": body,
+                      "color": color,
+                      "footer": {"text": repo_name},
+                      "timestamp": event["created_at"]
+                  }
                   embeds_to_send.append((embed, event_id))
 
           sent_count = 0
           for i, (embed, event_id) in enumerate(embeds_to_send):
               webhook_url = webhooks[i % len(webhooks)]
-              payload_json = {"allowed_mentions":{"parse":[]},"embeds":[embed]}
+              payload_json = {"allowed_mentions": {"parse": []}, "embeds": [embed]}
               success = False
               for attempt in range(3):
-                  res = subprocess.run(["curl","-sS","-o","/dev/null","-w","%{http_code}","-H","Content-Type: application/json","-X","POST","--data",json.dumps(payload_json),webhook_url], capture_output=True, text=True)
-                  if res.returncode==0 and res.stdout.startswith("2"):
-                      sent_count+=1; success=True; break
+                  res = subprocess.run(
+                      ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
+                       "-H", "Content-Type: application/json",
+                       "-X", "POST", "--data", json.dumps(payload_json), webhook_url],
+                      capture_output=True, text=True
+                  )
+                  if res.returncode == 0 and res.stdout.startswith("2"):
+                      sent_count += 1
+                      success = True
+                      break
                   else:
                       print(f"HTTP {res.stdout.strip()} attempt {attempt+1}")
                       time.sleep(5)
@@ -254,7 +303,7 @@ jobs:
               latest_sent_id = event_id
               update_variable(latest_sent_id)
 
-              if i < len(embeds_to_send)-1:
+              if i < len(embeds_to_send) - 1:
                   delay = random.randint(60, 120)
                   print(f"Waiting {delay} seconds before next message...")
                   time.sleep(delay)
