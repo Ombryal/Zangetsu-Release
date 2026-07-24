@@ -6,7 +6,7 @@ on:
     - cron: "*/5 * * * *"
 
 permissions:
-  contents: read
+  contents: write          # for force-pushing the state files
 
 concurrency:
   group: zangetsu-event-watcher
@@ -15,32 +15,46 @@ concurrency:
 env:
   OWNER: Spyou
   REPO: Zangetsu
+  STATE_EVENT_FILE: .state/last_event_id.txt
+  STATE_SHA_FILE: .state/last_commit_sha.txt
 
 jobs:
   watch-events:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Read last processed IDs (from variables)
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read last processed IDs (from state files)
         id: last_ids
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           set -euo pipefail
           # Event ID
-          if LAST_EVENT="$(gh api "repos/${{ github.repository }}/actions/variables/LAST_ZANGETSU_EVENT_ID" --jq '.value' 2>/dev/null)"; then
-            echo "event_id=$LAST_EVENT" >> "$GITHUB_OUTPUT"
+          if [ -f "$STATE_EVENT_FILE" ]; then
+            LAST_EVENT="$(tr -d '\r\n' < "$STATE_EVENT_FILE")"
+            if [ -z "$LAST_EVENT" ]; then
+              LAST_EVENT="0"
+            fi
           else
-            echo "event_id=0" >> "$GITHUB_OUTPUT"
+            LAST_EVENT="0"
           fi
-          # Commit SHA
-          if LAST_SHA="$(gh api "repos/${{ github.repository }}/actions/variables/LAST_ZANGETSU_COMMIT_SHA" --jq '.value' 2>/dev/null)"; then
-            echo "commit_sha=$LAST_SHA" >> "$GITHUB_OUTPUT"
-          else
-            echo "commit_sha=0" >> "$GITHUB_OUTPUT"
-          fi
+          echo "event_id=$LAST_EVENT" >> "$GITHUB_OUTPUT"
 
-      - name: Fetch new commits (paginated, ensures no commit is missed)
+          # Commit SHA
+          if [ -f "$STATE_SHA_FILE" ]; then
+            LAST_SHA="$(tr -d '\r\n' < "$STATE_SHA_FILE")"
+            if [ -z "$LAST_SHA" ]; then
+              LAST_SHA="0"
+            fi
+          else
+            LAST_SHA="0"
+          fi
+          echo "commit_sha=$LAST_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch new commits (paginated)
         env:
           GH_TOKEN: ${{ github.token }}
           LAST_SHA: ${{ steps.last_ids.outputs.commit_sha }}
@@ -61,24 +75,20 @@ jobs:
               echo "GitHub API error on commits. Stopping."
               break
             fi
-
             if [ "$(jq '. | length' page_commits.json)" -eq 0 ]; then
               echo "No more commits."
               break
             fi
 
-            # If LAST_SHA is not "0", check if we've reached it on this page
             if [ "$LAST_SHA" != "0" ]; then
               FOUND=$(jq --arg sha "$LAST_SHA" 'map(select(.sha == $sha)) | length' page_commits.json)
               if [ "$FOUND" -gt 0 ]; then
-                # Keep only commits newer than LAST_SHA
                 jq --arg sha "$LAST_SHA" '[.[] | if .sha == $sha then empty else . end]' page_commits.json > filtered.json
                 mv filtered.json page_commits.json
                 STOP=1
               fi
             fi
 
-            # Merge this page into the total
             jq -s '.[0] + .[1]' all_commits.json page_commits.json > merged.json
             mv merged.json all_commits.json
 
@@ -88,9 +98,6 @@ jobs:
               STOP=1
             fi
           done
-
-          # If LAST_SHA was "0", we fetched all commits (up to limit). No filtering needed.
-          # The resulting all_commits.json contains new commits newest-first.
 
       - name: Fetch new repository events (paginated)
         env:
@@ -134,13 +141,12 @@ jobs:
             fi
           done
 
-      - name: Process events & commits, send to Discord
+      - name: Process events & commits, send in chronological order
         env:
           WEBHOOK_1: ${{ secrets.DISCORD_EVENTS_WEBHOOK_URL_1 }}
           WEBHOOK_2: ${{ secrets.DISCORD_EVENTS_WEBHOOK_URL_2 }}
           LAST_EVENT_ID: ${{ steps.last_ids.outputs.event_id }}
           LAST_COMMIT_SHA: ${{ steps.last_ids.outputs.commit_sha }}
-          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           set -euo pipefail
 
@@ -160,29 +166,13 @@ jobs:
 
           webhooks = [os.environ["WEBHOOK_1"], os.environ["WEBHOOK_2"]]
 
-          def update_variable(name, value):
-              repo = os.environ["GITHUB_REPOSITORY"]
-              patch = subprocess.run(
-                  ["gh", "api", "--method", "PATCH",
-                   f"repos/{repo}/actions/variables/{name}",
-                   "-f", f"name={name}",
-                   "-f", f"value={value}"],
-                  capture_output=True, text=True
-              )
-              if patch.returncode == 0:
-                  print(f"Updated {name} to {value}")
-                  return
-              post = subprocess.run(
-                  ["gh", "api", "--method", "POST",
-                   f"repos/{repo}/actions/variables",
-                   "-f", f"name={name}",
-                   "-f", f"value={value}"],
-                  capture_output=True, text=True
-              )
-              if post.returncode == 0:
-                  print(f"Created {name} with {value}")
-                  return
-              raise RuntimeError(f"Cannot update/create {name}")
+          def save_progress(event_id, commit_sha):
+              """Write the latest processed IDs to temporary files.
+                 They will be committed and pushed by the next step."""
+              with open("latest_event_id.txt", "w") as f:
+                  f.write(str(event_id))
+              with open("latest_commit_sha.txt", "w") as f:
+                  f.write(commit_sha)
 
           def send_embed(embed, webhook_url):
               payload = {"allowed_mentions": {"parse": []}, "embeds": [embed]}
@@ -200,33 +190,30 @@ jobs:
                       time.sleep(5)
               return False
 
-          embeds_to_send = []
+          all_items = []
           repo_name = os.environ["OWNER"] + "/" + os.environ["REPO"]
           repo_url = f"https://github.com/{repo_name}"
 
-          # -------- 1. Process commits (from Commits API) --------
-          # commits_data is newest first; we'll process them oldest first.
-          # Build a set of SHAs seen in events for deduplication.
+          # Build a set of SHAs from events for deduplication
           event_sha_set = set()
           for ev in events_data:
               if ev["type"] == "PushEvent":
                   for c in ev.get("payload", {}).get("commits", []):
                       event_sha_set.add(c["sha"])
 
-          # Convert commits to embed list (oldest first)
+          # ---- Commits ----
           if commits_data:
-              # Reverse to get oldest first
-              commits_chrono = list(reversed(commits_data))
+              commits_chrono = list(reversed(commits_data))   # oldest first
               for commit in commits_chrono:
                   sha = commit["sha"]
                   if sha in event_sha_set:
-                      continue   # already covered by a PushEvent
+                      continue
                   message = commit["commit"]["message"].split("\n")[0]
                   author = commit["commit"]["author"]["name"]
                   committer = commit["committer"]
                   avatar = committer["avatar_url"] + "&s=80" if committer else ""
                   name = committer["login"] if committer else author
-                  timestamp = commit["commit"]["committer"]["date"]
+                  ts = commit["commit"]["committer"]["date"]
 
                   embed = {
                       "author": {"name": name, "icon_url": avatar},
@@ -235,15 +222,14 @@ jobs:
                       "description": f"[`{sha[:7]}`]({repo_url}/commit/{sha}) {message} — **{author}**",
                       "color": 0x57A9FF,
                       "footer": {"text": repo_name},
-                      "timestamp": timestamp
+                      "timestamp": ts
                   }
-                  embeds_to_send.append(("commit", sha, embed))
+                  all_items.append({"ts": ts, "embed": embed, "type": "commit", "id": sha})
 
-          # The newest commit SHA in the whole list (first element of original commits_data) is our latest.
-          if commits_data and len(commits_data) > 0:
+              # Newest commit SHA
               latest_commit_sha = commits_data[0]["sha"]
 
-          # -------- 2. Process events --------
+          # ---- Events ----
           sorted_events = sorted(events_data, key=lambda e: int(e["id"]))
           for event in sorted_events:
               event_id = int(event["id"])
@@ -257,6 +243,7 @@ jobs:
               payload = event.get("payload", {})
               repo_name_ev = event["repo"]["name"]
               repo_url_ev = f"https://github.com/{repo_name_ev}"
+              ts = event["created_at"]
 
               if event["type"] == "PushEvent":
                   if payload.get("deleted"):
@@ -302,9 +289,9 @@ jobs:
                       "description": description,
                       "color": 0x57A9FF,
                       "footer": {"text": repo_name_ev},
-                      "timestamp": event["created_at"]
+                      "timestamp": ts
                   }
-                  embeds_to_send.append(("event", event_id, embed))
+                  all_items.append({"ts": ts, "embed": embed, "type": "event", "id": event_id})
 
               elif event["type"] == "ForkEvent":
                   forkee = payload["forkee"]["full_name"]
@@ -314,9 +301,9 @@ jobs:
                       "url": f"https://github.com/{forkee}",
                       "color": 0xFFAC33,
                       "footer": {"text": repo_name_ev},
-                      "timestamp": event["created_at"]
+                      "timestamp": ts
                   }
-                  embeds_to_send.append(("event", event_id, embed))
+                  all_items.append({"ts": ts, "embed": embed, "type": "event", "id": event_id})
 
               elif event["type"] == "WatchEvent":
                   embed = {
@@ -325,9 +312,9 @@ jobs:
                       "url": repo_url_ev,
                       "color": 0xFFD700,
                       "footer": {"text": repo_name_ev},
-                      "timestamp": event["created_at"]
+                      "timestamp": ts
                   }
-                  embeds_to_send.append(("event", event_id, embed))
+                  all_items.append({"ts": ts, "embed": embed, "type": "event", "id": event_id})
 
               elif event["type"] == "IssuesEvent":
                   issue = payload["issue"]
@@ -341,9 +328,9 @@ jobs:
                       "description": body,
                       "color": color,
                       "footer": {"text": repo_name_ev},
-                      "timestamp": event["created_at"]
+                      "timestamp": ts
                   }
-                  embeds_to_send.append(("event", event_id, embed))
+                  all_items.append({"ts": ts, "embed": embed, "type": "event", "id": event_id})
 
               elif event["type"] == "IssueCommentEvent":
                   issue = payload["issue"]
@@ -356,9 +343,9 @@ jobs:
                       "description": body,
                       "color": 0x5865F2,
                       "footer": {"text": repo_name_ev},
-                      "timestamp": event["created_at"]
+                      "timestamp": ts
                   }
-                  embeds_to_send.append(("event", event_id, embed))
+                  all_items.append({"ts": ts, "embed": embed, "type": "event", "id": event_id})
 
               elif event["type"] == "PullRequestEvent":
                   pr = payload["pull_request"]
@@ -372,32 +359,79 @@ jobs:
                       "description": body,
                       "color": color,
                       "footer": {"text": repo_name_ev},
-                      "timestamp": event["created_at"]
+                      "timestamp": ts
                   }
-                  embeds_to_send.append(("event", event_id, embed))
+                  all_items.append({"ts": ts, "embed": embed, "type": "event", "id": event_id})
 
               # Update latest event ID
               if event_id > latest_event_id:
                   latest_event_id = event_id
 
-          # -------- 3. Send all embeds (30-second delay) --------
+          # ---- Sort all items chronologically ----
+          all_items.sort(key=lambda x: x["ts"])
+
+          # ---- Send in order with 30s delay ----
           sent = 0
-          for i, (src, identifier, embed) in enumerate(embeds_to_send):
+          for i, item in enumerate(all_items):
               webhook_url = webhooks[i % 2]
-              if not send_embed(embed, webhook_url):
-                  print(f"Failed to send {src} {identifier}. Stopping.")
+              if not send_embed(item["embed"], webhook_url):
+                  print(f"Failed to send {item['type']} {item['id']}. Stopping.")
                   break
               sent += 1
 
-              # Save progress immediately
-              if src == "event":
-                  update_variable("LAST_ZANGETSU_EVENT_ID", str(identifier))
-              else:  # commit
-                  update_variable("LAST_ZANGETSU_COMMIT_SHA", identifier)
+              # Update the in-memory latest IDs
+              if item["type"] == "event":
+                  latest_event_id = max(latest_event_id, int(item["id"]))
+              else:   # commit
+                  latest_commit_sha = item["id"]
 
-              if i < len(embeds_to_send) - 1:
+              # Write progress to temp files after each successful send
+              save_progress(latest_event_id, latest_commit_sha)
+
+              if i < len(all_items) - 1:
                   print("Waiting 30 seconds...")
                   time.sleep(30)
 
           print(f"Sent {sent} messages.")
           PY
+
+      - name: Save latest IDs to repository (state files)
+        run: |
+          set -euo pipefail
+
+          # If the Python script never wrote the progress files, nothing to save
+          if [ ! -f latest_event_id.txt ] || [ ! -f latest_commit_sha.txt ]; then
+            echo "No progress files found. Nothing to commit."
+            exit 0
+          fi
+
+          mkdir -p .state
+          cp latest_event_id.txt "$STATE_EVENT_FILE"
+          cp latest_commit_sha.txt "$STATE_SHA_FILE"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Force-add the state files (in case they are .gitignored)
+          git add -f "$STATE_EVENT_FILE" "$STATE_SHA_FILE"
+
+          # Only commit if something changed
+          if git diff --cached --quiet; then
+            echo "State files unchanged, nothing to commit."
+            exit 0
+          fi
+
+          git commit -m "Update last event ID and commit SHA"
+
+          # Push with retry
+          for i in 1 2 3; do
+            echo "Push attempt $i..."
+            if git push origin HEAD; then
+              echo "Push successful."
+              exit 0
+            fi
+            sleep 5
+          done
+
+          echo "::error::Push failed after 3 attempts."
+          exit 1
