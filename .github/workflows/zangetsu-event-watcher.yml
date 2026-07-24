@@ -21,77 +21,125 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Read last processed event ID (from variable)
-        id: last_event
+      - name: Read last processed IDs (from variables)
+        id: last_ids
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           set -euo pipefail
-          if LAST_ID="$(gh api "repos/${{ github.repository }}/actions/variables/LAST_ZANGETSU_EVENT_ID" --jq '.value' 2>/dev/null)"; then
-            echo "Last processed event ID: $LAST_ID"
-            echo "id=$LAST_ID" >> "$GITHUB_OUTPUT"
+          # Event ID
+          if LAST_EVENT="$(gh api "repos/${{ github.repository }}/actions/variables/LAST_ZANGETSU_EVENT_ID" --jq '.value' 2>/dev/null)"; then
+            echo "event_id=$LAST_EVENT" >> "$GITHUB_OUTPUT"
           else
-            echo "Variable not found, starting from 0."
-            echo "id=0" >> "$GITHUB_OUTPUT"
+            echo "event_id=0" >> "$GITHUB_OUTPUT"
+          fi
+          # Commit SHA
+          if LAST_SHA="$(gh api "repos/${{ github.repository }}/actions/variables/LAST_ZANGETSU_COMMIT_SHA" --jq '.value' 2>/dev/null)"; then
+            echo "commit_sha=$LAST_SHA" >> "$GITHUB_OUTPUT"
+          else
+            echo "commit_sha=0" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Fetch all new repository events (paginated, handles API limits)
+      - name: Fetch new commits (paginated, ensures no commit is missed)
         env:
           GH_TOKEN: ${{ github.token }}
-          LAST_ID: ${{ steps.last_event.outputs.id }}
+          LAST_SHA: ${{ steps.last_ids.outputs.commit_sha }}
         run: |
           set -euo pipefail
-          LAST_ID="$LAST_ID"
+          LAST_SHA="$LAST_SHA"
+          PAGE=1
+          STOP=0
+          echo "[]" > all_commits.json
+
+          while [ $STOP -eq 0 ]; do
+            echo "Fetching commits page $PAGE..."
+            set +e
+            gh api "repos/$OWNER/$REPO/commits?sha=main&per_page=100&page=$PAGE" > page_commits.json 2>/dev/null
+            GH_EXIT=$?
+            set -e
+            if [ $GH_EXIT -ne 0 ]; then
+              echo "GitHub API error on commits. Stopping."
+              break
+            fi
+
+            if [ "$(jq '. | length' page_commits.json)" -eq 0 ]; then
+              echo "No more commits."
+              break
+            fi
+
+            # If LAST_SHA is not "0", check if we've reached it on this page
+            if [ "$LAST_SHA" != "0" ]; then
+              FOUND=$(jq --arg sha "$LAST_SHA" 'map(select(.sha == $sha)) | length' page_commits.json)
+              if [ "$FOUND" -gt 0 ]; then
+                # Keep only commits newer than LAST_SHA
+                jq --arg sha "$LAST_SHA" '[.[] | if .sha == $sha then empty else . end]' page_commits.json > filtered.json
+                mv filtered.json page_commits.json
+                STOP=1
+              fi
+            fi
+
+            # Merge this page into the total
+            jq -s '.[0] + .[1]' all_commits.json page_commits.json > merged.json
+            mv merged.json all_commits.json
+
+            PAGE=$((PAGE + 1))
+            if [ $PAGE -gt 10 ]; then
+              echo "Max commit pages reached."
+              STOP=1
+            fi
+          done
+
+          # If LAST_SHA was "0", we fetched all commits (up to limit). No filtering needed.
+          # The resulting all_commits.json contains new commits newest-first.
+
+      - name: Fetch new repository events (paginated)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LAST_EVENT_ID: ${{ steps.last_ids.outputs.event_id }}
+        run: |
+          set -euo pipefail
+          LAST_ID="$LAST_EVENT_ID"
           PAGE=1
           echo "[]" > new_events.json
 
           while true; do
-            echo "Fetching page $PAGE..."
-            # Temporarily ignore errors to handle pagination limits gracefully
+            echo "Fetching events page $PAGE..."
             set +e
             gh api "repos/$OWNER/$REPO/events?per_page=100&page=$PAGE" > page.json 2>api_error.log
             GH_EXIT=$?
             set -e
-
             if [ $GH_EXIT -ne 0 ]; then
               if grep -q 'HTTP 422' api_error.log 2>/dev/null; then
-                echo "Pagination limit reached (HTTP 422). Stopping fetch."
+                echo "Pagination limit reached."
               else
-                echo "GitHub API error. Stopping."
+                echo "GitHub API error."
               fi
               break
             fi
-
-            EVENTS_COUNT="$(jq '. | length' page.json)"
-            if [ "$EVENTS_COUNT" -eq 0 ]; then
+            if [ "$(jq '. | length' page.json)" -eq 0 ]; then
               echo "No more events."
               break
             fi
-
-            # Check the newest event on this page (first element)
             NEWEST_ID="$(jq -r '.[0].id | tonumber' page.json)"
             if [ "$NEWEST_ID" -le "$LAST_ID" ]; then
-              echo "All events on this page are already processed. Stopping."
+              echo "All events already processed."
               break
             fi
-
-            # Merge page into the total collection
             jq -s '.[0] + .[1]' new_events.json page.json > merged.json
             mv merged.json new_events.json
-
             PAGE=$((PAGE + 1))
-            # Safety limit: stop after 10 pages to avoid excessive API calls
             if [ $PAGE -gt 10 ]; then
-              echo "Reached maximum pages (10). Stopping."
+              echo "Max pages reached."
               break
             fi
           done
 
-      - name: Process new events and send to Discord (resumable, 30s delay)
+      - name: Process events & commits, send to Discord
         env:
           WEBHOOK_1: ${{ secrets.DISCORD_EVENTS_WEBHOOK_URL_1 }}
           WEBHOOK_2: ${{ secrets.DISCORD_EVENTS_WEBHOOK_URL_2 }}
-          LAST_ID: ${{ steps.last_event.outputs.id }}
+          LAST_EVENT_ID: ${{ steps.last_ids.outputs.event_id }}
+          LAST_COMMIT_SHA: ${{ steps.last_ids.outputs.commit_sha }}
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           set -euo pipefail
@@ -99,54 +147,107 @@ jobs:
           python3 - <<'PY'
           import json, os, subprocess, sys, time
 
+          with open("all_commits.json", "r", encoding="utf-8") as f:
+              commits_data = json.load(f)
           with open("new_events.json", "r", encoding="utf-8") as f:
-              events = json.load(f)
+              events_data = json.load(f)
 
           EVENT_TYPES = {"PushEvent", "ForkEvent", "WatchEvent", "IssuesEvent", "IssueCommentEvent", "PullRequestEvent"}
-          last_id = int(os.environ["LAST_ID"])
-          latest_sent_id = last_id
+          last_event_id = int(os.environ["LAST_EVENT_ID"])
+          last_commit_sha = os.environ["LAST_COMMIT_SHA"]
+          latest_event_id = last_event_id
+          latest_commit_sha = last_commit_sha
 
-          webhooks = []
-          for key in ("WEBHOOK_1", "WEBHOOK_2"):
-              url = os.environ.get(key, "").strip()
-              if url:
-                  webhooks.append(url)
-          if not webhooks:
-              print("No webhook URLs configured. Exiting.")
-              sys.exit(0)
+          webhooks = [os.environ["WEBHOOK_1"], os.environ["WEBHOOK_2"]]
 
-          def update_variable(new_id):
+          def update_variable(name, value):
               repo = os.environ["GITHUB_REPOSITORY"]
               patch = subprocess.run(
                   ["gh", "api", "--method", "PATCH",
-                   f"repos/{repo}/actions/variables/LAST_ZANGETSU_EVENT_ID",
-                   "-f", "name=LAST_ZANGETSU_EVENT_ID",
-                   "-f", f"value={new_id}"],
+                   f"repos/{repo}/actions/variables/{name}",
+                   "-f", f"name={name}",
+                   "-f", f"value={value}"],
                   capture_output=True, text=True
               )
               if patch.returncode == 0:
-                  print(f"Updated variable to {new_id}")
+                  print(f"Updated {name} to {value}")
                   return
-              print(f"PATCH failed, creating variable. Error: {patch.stderr.strip()}")
               post = subprocess.run(
                   ["gh", "api", "--method", "POST",
                    f"repos/{repo}/actions/variables",
-                   "-f", "name=LAST_ZANGETSU_EVENT_ID",
-                   "-f", f"value={new_id}"],
+                   "-f", f"name={name}",
+                   "-f", f"value={value}"],
                   capture_output=True, text=True
               )
               if post.returncode == 0:
-                  print(f"Created variable with {new_id}")
+                  print(f"Created {name} with {value}")
                   return
-              print(f"POST also failed: {post.stderr.strip()}")
-              raise RuntimeError("Cannot update or create variable.")
+              raise RuntimeError(f"Cannot update/create {name}")
 
-          sorted_events = sorted(events, key=lambda e: int(e["id"]))
+          def send_embed(embed, webhook_url):
+              payload = {"allowed_mentions": {"parse": []}, "embeds": [embed]}
+              for attempt in range(3):
+                  res = subprocess.run(
+                      ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
+                       "-H", "Content-Type: application/json",
+                       "-X", "POST", "--data", json.dumps(payload), webhook_url],
+                      capture_output=True, text=True
+                  )
+                  if res.returncode == 0 and res.stdout.startswith("2"):
+                      return True
+                  else:
+                      print(f"HTTP {res.stdout.strip()} attempt {attempt+1}")
+                      time.sleep(5)
+              return False
+
           embeds_to_send = []
+          repo_name = os.environ["OWNER"] + "/" + os.environ["REPO"]
+          repo_url = f"https://github.com/{repo_name}"
 
+          # -------- 1. Process commits (from Commits API) --------
+          # commits_data is newest first; we'll process them oldest first.
+          # Build a set of SHAs seen in events for deduplication.
+          event_sha_set = set()
+          for ev in events_data:
+              if ev["type"] == "PushEvent":
+                  for c in ev.get("payload", {}).get("commits", []):
+                      event_sha_set.add(c["sha"])
+
+          # Convert commits to embed list (oldest first)
+          if commits_data:
+              # Reverse to get oldest first
+              commits_chrono = list(reversed(commits_data))
+              for commit in commits_chrono:
+                  sha = commit["sha"]
+                  if sha in event_sha_set:
+                      continue   # already covered by a PushEvent
+                  message = commit["commit"]["message"].split("\n")[0]
+                  author = commit["commit"]["author"]["name"]
+                  committer = commit["committer"]
+                  avatar = committer["avatar_url"] + "&s=80" if committer else ""
+                  name = committer["login"] if committer else author
+                  timestamp = commit["commit"]["committer"]["date"]
+
+                  embed = {
+                      "author": {"name": name, "icon_url": avatar},
+                      "title": f"[{repo_name}:main] 1 new commit",
+                      "url": f"{repo_url}/tree/main",
+                      "description": f"[`{sha[:7]}`]({repo_url}/commit/{sha}) {message} — **{author}**",
+                      "color": 0x57A9FF,
+                      "footer": {"text": repo_name},
+                      "timestamp": timestamp
+                  }
+                  embeds_to_send.append(("commit", sha, embed))
+
+          # The newest commit SHA in the whole list (first element of original commits_data) is our latest.
+          if commits_data and len(commits_data) > 0:
+              latest_commit_sha = commits_data[0]["sha"]
+
+          # -------- 2. Process events --------
+          sorted_events = sorted(events_data, key=lambda e: int(e["id"]))
           for event in sorted_events:
               event_id = int(event["id"])
-              if event_id <= last_id:
+              if event_id <= last_event_id:
                   continue
               if event["type"] not in EVENT_TYPES:
                   continue
@@ -154,25 +255,23 @@ jobs:
               avatar_url = actor["avatar_url"] + "&s=80"
               actor_name = actor["display_login"]
               payload = event.get("payload", {})
-              repo_name = event["repo"]["name"]
-              repo_url = f"https://github.com/{repo_name}"
+              repo_name_ev = event["repo"]["name"]
+              repo_url_ev = f"https://github.com/{repo_name_ev}"
 
-              # ---- PushEvent ----
               if event["type"] == "PushEvent":
                   if payload.get("deleted"):
                       continue
-
                   ref = payload.get("ref", "").replace("refs/heads/", "").replace("refs/tags/", "")
                   commits = payload.get("commits", [])
                   after_sha = payload.get("after", "")
-                  branch_url = f"{repo_url}/tree/{ref}" if ref else repo_url
+                  branch_url = f"{repo_url_ev}/tree/{ref}" if ref else repo_url_ev
 
                   if commits:
                       commit_lines = []
                       for c in commits:
-                          fsha = c["sha"]
+                          sha = c["sha"]
                           commit_lines.append(
-                              f"[`{fsha[:7]}`]({repo_url}/commit/{fsha}) {c['message'].split(chr(10))[0]} — **{c['author']['name']}**"
+                              f"[`{sha[:7]}`]({repo_url_ev}/commit/{sha}) {c['message'].split(chr(10))[0]} — **{c['author']['name']}**"
                           )
                       commit_count = len(commits)
                       description = "\n".join(commit_lines)
@@ -180,59 +279,56 @@ jobs:
                       head = payload.get("head_commit")
                       size = payload.get("size", 0)
                       if head:
-                          fsha = head["sha"]
+                          sha = head["sha"]
                           description = (
-                              f"[`{fsha[:7]}`]({repo_url}/commit/{fsha}) "
+                              f"[`{sha[:7]}`]({repo_url_ev}/commit/{sha}) "
                               f"{head['message'].split(chr(10))[0]} — **{head['author']['name']}**"
                           )
                           commit_count = 1 if size == 0 else size
                       elif after_sha and after_sha != "0000000000000000000000000000000000000000":
-                          description = f"[`{after_sha[:7]}`]({repo_url}/commit/{after_sha}) (details not available)"
+                          description = f"[`{after_sha[:7]}`]({repo_url_ev}/commit/{after_sha}) (details not available)"
                           commit_count = size if size > 0 else 1
                       elif size and size > 0:
                           description = f"{size} commit{'s' if size > 1 else ''} (details not available)"
                           commit_count = size
                       else:
-                          continue  # no commit info → skip
+                          continue
 
-                  title = f"[{repo_name}:{ref}] {commit_count} new commit{'s' if commit_count != 1 else ''}"
+                  title = f"[{repo_name_ev}:{ref}] {commit_count} new commit{'s' if commit_count != 1 else ''}"
                   embed = {
                       "author": {"name": actor_name, "icon_url": avatar_url},
                       "title": title,
                       "url": branch_url,
                       "description": description,
                       "color": 0x57A9FF,
-                      "footer": {"text": repo_name},
+                      "footer": {"text": repo_name_ev},
                       "timestamp": event["created_at"]
                   }
-                  embeds_to_send.append((embed, event_id))
+                  embeds_to_send.append(("event", event_id, embed))
 
-              # ---- ForkEvent ----
               elif event["type"] == "ForkEvent":
                   forkee = payload["forkee"]["full_name"]
                   embed = {
                       "author": {"name": actor_name, "icon_url": avatar_url},
-                      "title": f"[{repo_name}] Fork created: {forkee}",
+                      "title": f"[{repo_name_ev}] Fork created: {forkee}",
                       "url": f"https://github.com/{forkee}",
                       "color": 0xFFAC33,
-                      "footer": {"text": repo_name},
+                      "footer": {"text": repo_name_ev},
                       "timestamp": event["created_at"]
                   }
-                  embeds_to_send.append((embed, event_id))
+                  embeds_to_send.append(("event", event_id, embed))
 
-              # ---- WatchEvent ----
               elif event["type"] == "WatchEvent":
                   embed = {
                       "author": {"name": actor_name, "icon_url": avatar_url},
-                      "title": f"[{repo_name}] New star added",
-                      "url": repo_url,
+                      "title": f"[{repo_name_ev}] New star added",
+                      "url": repo_url_ev,
                       "color": 0xFFD700,
-                      "footer": {"text": repo_name},
+                      "footer": {"text": repo_name_ev},
                       "timestamp": event["created_at"]
                   }
-                  embeds_to_send.append((embed, event_id))
+                  embeds_to_send.append(("event", event_id, embed))
 
-              # ---- IssuesEvent ----
               elif event["type"] == "IssuesEvent":
                   issue = payload["issue"]
                   action = payload["action"]
@@ -240,32 +336,30 @@ jobs:
                   color = 0xED4245 if action in ("opened", "reopened") else 0x57F287
                   embed = {
                       "author": {"name": actor_name, "icon_url": avatar_url},
-                      "title": f"[{repo_name}] Issue {action}: #{issue['number']} {issue['title']}",
+                      "title": f"[{repo_name_ev}] Issue {action}: #{issue['number']} {issue['title']}",
                       "url": issue["html_url"],
                       "description": body,
                       "color": color,
-                      "footer": {"text": repo_name},
+                      "footer": {"text": repo_name_ev},
                       "timestamp": event["created_at"]
                   }
-                  embeds_to_send.append((embed, event_id))
+                  embeds_to_send.append(("event", event_id, embed))
 
-              # ---- IssueCommentEvent ----
               elif event["type"] == "IssueCommentEvent":
                   issue = payload["issue"]
                   comment = payload["comment"]
                   body = comment["body"][:500]
                   embed = {
                       "author": {"name": actor_name, "icon_url": avatar_url},
-                      "title": f"[{repo_name}] New comment on issue #{issue['number']}: {issue['title']}",
+                      "title": f"[{repo_name_ev}] New comment on issue #{issue['number']}: {issue['title']}",
                       "url": comment["html_url"],
                       "description": body,
                       "color": 0x5865F2,
-                      "footer": {"text": repo_name},
+                      "footer": {"text": repo_name_ev},
                       "timestamp": event["created_at"]
                   }
-                  embeds_to_send.append((embed, event_id))
+                  embeds_to_send.append(("event", event_id, embed))
 
-              # ---- PullRequestEvent ----
               elif event["type"] == "PullRequestEvent":
                   pr = payload["pull_request"]
                   action = payload["action"]
@@ -273,45 +367,37 @@ jobs:
                   color = 0x5865F2 if action in ("opened", "reopened") else 0x57F287
                   embed = {
                       "author": {"name": actor_name, "icon_url": avatar_url},
-                      "title": f"[{repo_name}] Pull Request {action}: #{pr['number']} {pr['title']}",
+                      "title": f"[{repo_name_ev}] Pull Request {action}: #{pr['number']} {pr['title']}",
                       "url": pr["html_url"],
                       "description": body,
                       "color": color,
-                      "footer": {"text": repo_name},
+                      "footer": {"text": repo_name_ev},
                       "timestamp": event["created_at"]
                   }
-                  embeds_to_send.append((embed, event_id))
+                  embeds_to_send.append(("event", event_id, embed))
 
-          sent_count = 0
-          for i, (embed, event_id) in enumerate(embeds_to_send):
-              webhook_url = webhooks[i % len(webhooks)]
-              payload_json = {"allowed_mentions": {"parse": []}, "embeds": [embed]}
-              success = False
-              for attempt in range(3):
-                  res = subprocess.run(
-                      ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}",
-                       "-H", "Content-Type: application/json",
-                       "-X", "POST", "--data", json.dumps(payload_json), webhook_url],
-                      capture_output=True, text=True
-                  )
-                  if res.returncode == 0 and res.stdout.startswith("2"):
-                      sent_count += 1
-                      success = True
-                      break
-                  else:
-                      print(f"HTTP {res.stdout.strip()} attempt {attempt+1}")
-                      time.sleep(5)
-              if not success:
-                  print(f"Failed to send embed for event {event_id}. Stopping.")
+              # Update latest event ID
+              if event_id > latest_event_id:
+                  latest_event_id = event_id
+
+          # -------- 3. Send all embeds (30-second delay) --------
+          sent = 0
+          for i, (src, identifier, embed) in enumerate(embeds_to_send):
+              webhook_url = webhooks[i % 2]
+              if not send_embed(embed, webhook_url):
+                  print(f"Failed to send {src} {identifier}. Stopping.")
                   break
+              sent += 1
 
-              latest_sent_id = event_id
-              update_variable(latest_sent_id)
+              # Save progress immediately
+              if src == "event":
+                  update_variable("LAST_ZANGETSU_EVENT_ID", str(identifier))
+              else:  # commit
+                  update_variable("LAST_ZANGETSU_COMMIT_SHA", identifier)
 
-              # Wait exactly 30 seconds before next message (except the last)
               if i < len(embeds_to_send) - 1:
-                  print("Waiting 30 seconds before next message...")
+                  print("Waiting 30 seconds...")
                   time.sleep(30)
 
-          print(f"Sent {sent_count} message(s).")
+          print(f"Sent {sent} messages.")
           PY
