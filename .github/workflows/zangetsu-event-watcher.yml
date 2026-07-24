@@ -147,9 +147,14 @@ jobs:
 
               # ---- PushEvent ----
               if event["type"] == "PushEvent":
-                  ref = payload.get("ref", "").replace("refs/heads/", "")
+                  # Skip branch / tag deletions
+                  if payload.get("deleted"):
+                      continue
+
+                  ref = payload.get("ref", "").replace("refs/heads/", "").replace("refs/tags/", "")
                   commits = payload.get("commits", [])
-                  branch_url = f"{repo_url}/tree/{ref}"
+                  after_sha = payload.get("after", "")
+                  branch_url = f"{repo_url}/tree/{ref}" if ref else repo_url
 
                   if commits:
                       commit_lines = []
@@ -163,6 +168,7 @@ jobs:
                   else:
                       head = payload.get("head_commit")
                       size = payload.get("size", 0)
+                      # Use head_commit if available, otherwise fall back to 'after' SHA
                       if head:
                           fsha = head["sha"]
                           description = (
@@ -170,12 +176,15 @@ jobs:
                               f"{head['message'].split(chr(10))[0]} — **{head['author']['name']}**"
                           )
                           commit_count = 1 if size == 0 else size
+                      elif after_sha and after_sha != "0000000000000000000000000000000000000000":
+                          description = f"[`{after_sha[:7]}`]({repo_url}/commit/{after_sha}) (details not available)"
+                          commit_count = size if size > 0 else 1
                       elif size and size > 0:
                           description = f"{size} commit{'s' if size > 1 else ''} (details not available)"
                           commit_count = size
                       else:
-                          description = "Push event (no commit details)"
-                          commit_count = 0
+                          # No commit info at all – skip
+                          continue
 
                   title = f"[{repo_name}:{ref}] {commit_count} new commit{'s' if commit_count != 1 else ''}"
                   embed = {
